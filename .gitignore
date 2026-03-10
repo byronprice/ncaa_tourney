@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+*.DS_Store
+data/raw/*.html
+data/raw/*.json
+data/raw/*.csv
+data/processed/*.csv
+output/*.csv
+output/*.json
