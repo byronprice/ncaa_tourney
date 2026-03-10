@@ -161,7 +161,8 @@ export KENPOM_COOKIE='your_cookie_header_here'
 - `safe`: uses pure model probabilities (no strategy adjustment)
 - `balanced`: pulls favorites partway toward 50/50 to increase variance
 - `upset_heavy`: pulls favorites more strongly toward 50/50, creating the highest variance
-- `optimize-picks` also supports `--opponent-safe-seed-chalk-share` so part of the simulated `safe` field can use seed-based chalk behavior.
+- `optimize-picks` supports `--opponent-safe-seed-chalk-share` so part of the simulated `safe` field can use seed-based chalk behavior.
+- Built-in seed-pair upset priors are applied for `R64`, `R32`, and `S16` in this seed-based mode (with fallback logic for missing pairs).
 - If you provide `--opponent-seed-popularity`, those seed-pair upset rates are taken from your file (instead of built-in priors) for rounds listed in the file.
 
 ### ESPN pick popularity file format
@@ -202,5 +203,23 @@ S16,1,4,31
 - KenPom data is intentionally handled as a manual import workflow by default to avoid brittle scraping and access issues.
 
 ## Full model run with optimizer
-conda run -n ncaab python -m ncaa_tourney.cli optimize-picks --teams data/processed/top64_teams.csv --games data/processed/top64_round1_games.csv --pool-size 50 --n-candidates 1000 --n-outcomes 500 --seed 42 --spread-a 0.0 --spread-b 12.1 --opponent-safe-seed-chalk-share 0.5 --out output/optimized_picks_seedchalk_smoke.csv --out-summary output/optimized_picks_seedchalk_summary_smoke.csv
+
+```bash
+conda run -n ncaab python -m ncaa_tourney.cli optimize-picks \
+  --teams data/processed/top64_teams.csv \
+  --games data/processed/top64_round1_games.csv \
+  --pool-size 50 \
+  --n-candidates 500 \
+  --n-outcomes 5000 \
+  --round-points 1,2,4,8,16,32 \
+  --candidate-mix 0.34,0.33,0.33 \
+  --opponent-mix 0.5,0.35,0.15 \
+  --opponent-safe-seed-chalk-share 0.5 \
+  --opponent-seed-popularity data/raw/espn_pick_popularity.csv \
+  --seed 42 \
+  --spread-a 0.0 \
+  --spread-b 12.1 \
+  --out output/optimized_picks.csv \
+  --out-summary output/optimized_picks_summary.csv
+```
 
