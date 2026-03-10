@@ -43,6 +43,20 @@ python -m ncaa_tourney.cli init-tempo-template --out data/raw/tempo_manual.csv
 
 Fill `Team,AdjT` rows in that file.
 
+To pull ESPN BPI + KenPom tempo and write a merged source report:
+
+```bash
+conda run -n ncaab python -m ncaa_tourney.cli check-sources \
+  --rankings-source espn_bpi \
+  --tempo-source kenpom_html \
+  --tempo-path data/raw/kenpom_page.html \
+  --team-match-threshold 0.86 \
+  --default-tempo 68.0 \
+  --out-report output/source_link_report.csv \
+  --out-unmatched output/source_link_report_unmatched.csv \
+  --out-alias-suggestions output/source_link_report_alias_suggestions.csv
+```
+
 ### 3) Prepare bracket input
 
 If the official bracket endpoint/page changes, use manual fallback:
@@ -102,16 +116,6 @@ python -m ncaa_tourney.cli optimize-picks \
   --spread-b 12.99 \
   --out output/optimized_picks.csv \
   --out-summary output/optimized_picks_summary.csv
-
-python -m ncaa_tourney.cli check-sources \
-  --rankings-source espn_bpi \
-  --tempo-source kenpom_html \
-  --tempo-path data/raw/kenpom_page.html \
-  --team-match-threshold 0.86 \
-  --default-tempo 68.0 \
-  --out-report output/source_link_report.csv \
-  --out-unmatched output/source_link_report_unmatched.csv \
-  --out-alias-suggestions output/source_link_report_alias_suggestions.csv
 ```
 
 You can also try direct site pulls:
@@ -217,8 +221,8 @@ conda run -n ncaab python -m ncaa_tourney.cli optimize-picks \
   --opponent-safe-seed-chalk-share 0.5 \
   --opponent-seed-popularity data/raw/espn_pick_popularity.csv \
   --seed 42 \
-  --spread-a 0.0 \
-  --spread-b 12.1 \
+  --spread-a -0.78 \
+  --spread-b 12.99 \
   --out output/optimized_picks.csv \
   --out-summary output/optimized_picks_summary.csv
 ```
