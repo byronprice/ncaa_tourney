@@ -228,6 +228,18 @@ def load_tempo_kenpom_html(path: str) -> pd.DataFrame:
     return _parse_kenpom_tempo_tables(html, source="kenpom_html")
 
 
+def load_rankings_kenpom_public(url: str = "https://kenpom.com/") -> pd.DataFrame:
+    response = _fetch_webpage(url, cookie_env_var="KENPOM_COOKIE")
+    response.raise_for_status()
+    return _parse_kenpom_ratings_tables(response.text, source="kenpom_public")
+
+
+def load_rankings_kenpom_html(path: str) -> pd.DataFrame:
+    with open(path, "r", encoding="utf-8") as file:
+        html = file.read()
+    return _parse_kenpom_ratings_tables(html, source="kenpom_html")
+
+
 def _parse_kenpom_tempo_tables(html: str, source: str) -> pd.DataFrame:
     tables = pd.read_html(StringIO(html), flavor="lxml")
 
@@ -258,6 +270,101 @@ def _parse_kenpom_tempo_tables(html: str, source: str) -> pd.DataFrame:
     )
     out = out.dropna(subset=["Team", "Tempo"])
     return _normalize_tempo(out)
+
+
+def _parse_kenpom_ratings_tables(html: str, source: str) -> pd.DataFrame:
+    tables = pd.read_html(StringIO(html), flavor="lxml")
+
+    if not tables:
+        raise RuntimeError("No tables found on KenPom page")
+
+    ratings_table = None
+    for table in tables:
+        columns = [str(c) for c in table.columns]
+        if any("Team" in c for c in columns) and any("NetRtg" in c or "Net Rtg" in c for c in columns):
+            ratings_table = table
+            break
+
+    if ratings_table is None:
+        raise RuntimeError("Could not detect Team/NetRtg columns from KenPom table")
+
+    team_col = _first_matching_column(ratings_table, ["Team"])
+    # NetRtg header may appear as 'NetRtg' or 'Net Rtg' or 'AdjEM' depending on export
+    net_col = None
+    candidates: list[tuple[object, str]] = []
+    for col in ratings_table.columns:
+        name = str(col)
+        lname = name.lower()
+        compact = lname.replace(" ", "")
+        if "netrtg" in compact or "net rtg" in lname or "adjem" in lname:
+            candidates.append((col, lname))
+
+    def _looks_like_sos(header: str) -> bool:
+        return (
+            "sos" in header
+            or "strength" in header
+            or "strengthofschedule" in header
+            or "strength of schedule" in header
+        )
+
+    if candidates:
+        non_sos = [c for c in candidates if not _looks_like_sos(c[1])]
+        net_col = non_sos[0][0] if non_sos else candidates[0][0]
+
+    if team_col is None or net_col is None:
+        raise RuntimeError("Could not detect Team/NetRtg columns from KenPom table")
+
+    out = pd.DataFrame(
+        {
+            "Team": ratings_table[team_col].astype(str).map(_clean_team_name),
+            "Rating": pd.to_numeric(ratings_table[net_col], errors="coerce") * 0.7,
+            "Source": source,
+        }
+    )
+    out = out.dropna(subset=["Team", "Rating"])
+    return _normalize_rankings(out)
+
+
+def overlay_kenpom_ratings(
+    base_df: pd.DataFrame,
+    kenpom_df: pd.DataFrame,
+    min_similarity: float = 0.86,
+) -> pd.DataFrame:
+    """Return base_df (ESPN team names) with ratings replaced by KenPom values.
+
+    For each ESPN team, the best-matching KenPom team's rating is substituted.
+    Teams with no KenPom match keep their original ESPN rating.  Because we
+    iterate over ESPN teams exactly once, there are no duplicate team names.
+    """
+    kenpom_keys: dict[str, float] = {}
+    for row in kenpom_df.itertuples(index=False):
+        key = _resolve_alias(_canonical_team_key(str(row.Team)))
+        kenpom_keys[key] = float(row.Rating)
+    kenpom_key_list = list(kenpom_keys.keys())
+
+    result = base_df.copy()
+    for idx, row in base_df.iterrows():
+        team_name = str(row["Team"])
+        key = _resolve_alias(_canonical_team_key(team_name))
+
+        rating: float | None = None
+
+        if key in kenpom_keys:
+            rating = kenpom_keys[key]
+        else:
+            subset_key = _find_subset_match(key, kenpom_key_list)
+            if subset_key is not None and _token_overlap_score(key, subset_key) >= 0.75:
+                rating = kenpom_keys[subset_key]
+            else:
+                close = difflib.get_close_matches(key, kenpom_key_list, n=1, cutoff=min_similarity)
+                if close:
+                    rating = kenpom_keys[close[0]]
+
+        if rating is not None:
+            result.at[idx, "Rating"] = rating
+            result.at[idx, "Source"] = "kenpom_html"
+
+    return result
 
 
 def merge_rankings_with_tempo(
@@ -328,6 +435,69 @@ def merge_rankings_with_tempo(
     return pd.DataFrame(merged_rows).sort_values("Rating", ascending=False).reset_index(drop=True)
 
 
+def remap_team_names(
+    df: pd.DataFrame,
+    canonical_names: list[str],
+    min_similarity: float = 0.86,
+) -> pd.DataFrame:
+    """Replace the Team column with the closest match from canonical_names.
+
+    Uses the same matching pipeline as merge_rankings_with_tempo (exact key,
+    subset, fuzzy).  Each canonical name is claimed by at most one source team.
+    When multiple source teams propose the same canonical name, the winner is
+    chosen by direct string similarity between the original source name and the
+    original canonical display name — not by rating.  Losers are left unchanged.
+    """
+    canon_keys = {_resolve_alias(_canonical_team_key(n)): n for n in canonical_names}
+    canon_key_list = list(canon_keys.keys())
+
+    source_names = [str(n) for n in df["Team"]]
+
+    # Pass 1: for every source row compute its best candidate canonical key.
+    proposals: list[tuple[int, str | None]] = []  # (row_idx, canon_key or None)
+    for idx, team_name in enumerate(source_names):
+        key = _resolve_alias(_canonical_team_key(team_name))
+        if key in canon_keys:
+            proposals.append((idx, key))
+        else:
+            subset_key = _find_subset_match(key, canon_key_list)
+            if subset_key is not None:
+                proposals.append((idx, subset_key))
+            else:
+                close = difflib.get_close_matches(key, canon_key_list, n=1, cutoff=min_similarity)
+                proposals.append((idx, close[0] if close else None))
+
+    # Pass 2: for each canonical key that multiple rows propose, pick the winner
+    # by comparing the original source name against the canonical display name.
+    from collections import defaultdict
+    claimants: dict[str, list[int]] = defaultdict(list)
+    for row_idx, ck in proposals:
+        if ck is not None:
+            claimants[ck].append(row_idx)
+
+    winners: dict[int, str] = {}
+    for ck, row_indices in claimants.items():
+        display_name = canon_keys[ck]
+        if len(row_indices) == 1:
+            winners[row_indices[0]] = display_name
+        else:
+            # Pick the source name most similar to the canonical display name
+            def name_similarity(row_idx: int) -> float:
+                return difflib.SequenceMatcher(
+                    None,
+                    _clean_team_name(source_names[row_idx]).lower(),
+                    display_name.lower(),
+                ).ratio()
+            best = max(row_indices, key=name_similarity)
+            winners[best] = display_name
+
+    result = df.copy()
+    for row_idx, canon_name in winners.items():
+        result.at[row_idx, "Team"] = canon_name
+
+    return result
+
+
 def _first_matching_column(df: pd.DataFrame, keys: list[str]) -> str | None:
     for column in df.columns:
         name = str(column)
@@ -365,6 +535,7 @@ def _normalize_tempo(df: pd.DataFrame) -> pd.DataFrame:
 def _clean_team_name(name: str) -> str:
     cleaned = str(name)
     cleaned = re.sub(r"^\d+\s+", "", cleaned)
+    cleaned = re.sub(r"\s+\d+$", "", cleaned)
     cleaned = re.sub(r"\s+\(\d+-\d+\)$", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned

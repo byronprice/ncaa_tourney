@@ -57,6 +57,40 @@ conda run -n ncaab python -m ncaa_tourney.cli check-sources \
   --out-alias-suggestions output/source_link_report_alias_suggestions.csv
 ```
 
+Note: `check-sources` writes a merged, diagnostic report (for example `output/source_link_report.csv`) that shows how ranking teams were matched to tempo sources. This merged report is intended for inspection and alias-fixing and is not consumed directly by `build-dataset`.
+
+`build-dataset` expects separate ranking and tempo inputs (or will pull them automatically). To build the dataset after running `check-sources`, either:
+
+- Re-run `build-dataset` with the original source files, e.g. `--rankings-source manual_csv --rankings-path data/raw/rankings_manual.csv` and `--tempo-source manual_csv --tempo-path data/raw/tempo_manual.csv`.
+- Or generate/repair the `data/raw/rankings_manual.csv` and `data/raw/tempo_manual.csv` from the merged report (for example by exporting the `Team`, `Rating`, `Source` cols and the `Team`, `AdjT` tempo values into the two CSVs) and then run `build-dataset`.
+
+If you'd like `build-dataset` to accept the merged `source_link_report.csv` directly (so it uses the `Tempo` column already present), I can add that feature—would you like me to implement it?
+
+### Using a merged source report with `build-dataset`
+
+The CLI now supports using a merged source report directly as the rankings input. The merged CSV must contain at minimum these columns:
+
+- `Team` — team name
+- `Rating` — numeric rating (BPI or other)
+- `Source` — rating source label
+- `Tempo` — numeric tempo (`AdjT`)
+
+Optional but useful columns: `TempoSource`, `TempoMatchType`, `TempoMatchScore`.
+
+Example command (uses the merged report produced by `check-sources`):
+
+```bash
+python -m ncaa_tourney.cli build-dataset \
+  --rankings-source merged_report \
+  --rankings-path output/source_link_report.csv \
+  --bracket-source manual_csv \
+  --bracket-path data/raw/bracket_manual.csv \
+  --out-teams data/processed/teams.csv \
+  --out-games data/processed/round1_games.csv
+```
+
+When `--rankings-source merged_report` is used, `build-dataset` will read the `Tempo` values from the merged report and skip any additional tempo loading/merging steps.
+
 ### 3) Prepare bracket input
 
 If the official bracket endpoint/page changes, use manual fallback:

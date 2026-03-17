@@ -10,11 +10,15 @@ import pandas as pd
 
 ROUND_ORDER = ["R64", "R32", "S16", "E8", "F4", "NCG", "Champ"]
 
+# Maps frozenset({team_a, team_b}) -> (favorite_name, p_favorite)
+R64OddsTable = dict[frozenset[str], tuple[str, float]]
+
 # SPREAD_TO_Z_A = -0.78
 # SPREAD_TO_Z_B = 12.99
 SPREAD_TO_Z_A = 0.0
 SPREAD_TO_Z_B = 12.1
 SIGMA_70 = 12.1
+NATIONAL_AVG_TEMPO = 68.0
 
 STRATEGY_RANDOMNESS = {
     "safe": {"R64": 0.0, "R32": 0.0, "S16": 0.0, "E8": 0.0, "F4": 0.0, "NCG": 0.0},
@@ -129,13 +133,14 @@ def win_probability(
     sigma70: float = SIGMA_70,
     spread_a: float = SPREAD_TO_Z_A,
     spread_b: float = SPREAD_TO_Z_B,
+    national_avg_tempo: float = NATIONAL_AVG_TEMPO,
 ) -> float:
-    _ = sigma70
-    possessions = max((tempo_a + tempo_b) / 2.0, 55.0)
+    possessions = max(tempo_a + tempo_b - national_avg_tempo, 55.0)
     expected_spread = (rating_a - rating_b) * (possessions / 70.0)
+    sigma = spread_b * math.sqrt(possessions / 70.0)
 
     fav_spread = abs(expected_spread)
-    z_fav = (fav_spread - spread_a) / spread_b
+    z_fav = (fav_spread - spread_a) / sigma
     p_fav = 0.5 * (1.0 + math.erf(z_fav / math.sqrt(2.0)))
 
     p_a = p_fav if expected_spread >= 0 else 1.0 - p_fav
@@ -150,6 +155,7 @@ def simulate_tournament(
     sigma70: float = SIGMA_70,
     spread_a: float = SPREAD_TO_Z_A,
     spread_b: float = SPREAD_TO_Z_B,
+    r64_odds: R64OddsTable | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(seed)
     ratings = dict(zip(teams_df["Team"], teams_df["Rating"]))
@@ -171,7 +177,7 @@ def simulate_tournament(
             first_round = region_games[region]
             r64_winners = []
             for game in first_round:
-                winner = _simulate_game(game[0], game[1], ratings, tempos, sigma70, spread_a, spread_b, rng)
+                winner = _simulate_game(game[0], game[1], ratings, tempos, sigma70, spread_a, spread_b, rng, r64_odds)
                 r64_winners.append(winner)
                 full_path.append(f"{region}:R64:{winner}")
                 advancement[winner]["R32"] += 1
@@ -265,6 +271,7 @@ def generate_strategy_brackets(
     sigma70: float = 10.5,
     spread_a: float = SPREAD_TO_Z_A,
     spread_b: float = SPREAD_TO_Z_B,
+    r64_odds: R64OddsTable | None = None,
 ) -> pd.DataFrame:
     ratings = dict(zip(teams_df["Team"], teams_df["Rating"]))
     tempos = _build_tempo_map(teams_df)
@@ -275,16 +282,52 @@ def generate_strategy_brackets(
     for offset, strategy in enumerate(["safe", "balanced", "upset_heavy"]):
         rng = np.random.default_rng(seed + offset)
         rows.extend(
-            _run_strategy_once(strategy, regions, region_games, ratings, tempos, sigma70, spread_a, spread_b, rng)
+            _run_strategy_once(strategy, regions, region_games, ratings, tempos, sigma70, spread_a, spread_b, rng, r64_odds)
         )
 
     return pd.DataFrame(rows)
 
 
+def _greedy_portfolio_select(
+    scores_matrix: np.ndarray,
+    opp_max_matrix: np.ndarray,
+    opp_ties_matrix: np.ndarray,
+) -> list[tuple[int, float, float]]:
+    """Greedy sequential bracket selection maximizing P(at least one entry wins its pool).
+
+    Returns a list of (candidate_idx, marginal_equity, individual_equity) — one per entry/pool.
+    Each bracket is assigned to the pool at the same index in opp_max_matrix.
+    """
+    n_entries = opp_max_matrix.shape[0]
+    n_outcomes = scores_matrix.shape[1]
+    already_won = np.zeros(n_outcomes, dtype=bool)
+    selected: list[tuple[int, float, float]] = []
+
+    for k in range(n_entries):
+        opp_max_k = opp_max_matrix[k]
+        opp_ties_k = opp_ties_matrix[k]
+
+        wins = scores_matrix > opp_max_k[np.newaxis, :]
+        tie_mask = scores_matrix == opp_max_k[np.newaxis, :]
+        tie_vals = np.where(tie_mask, 1.0 / (opp_ties_k[np.newaxis, :].astype(np.float64) + 1.0), 0.0)
+        equity_per_outcome = wins.astype(np.float64) + tie_vals
+
+        uncovered = ~already_won
+        marginal = (equity_per_outcome * uncovered[np.newaxis, :]).mean(axis=1)
+        individual = equity_per_outcome.mean(axis=1)
+
+        best_idx = int(np.argmax(marginal))
+        selected.append((best_idx, float(marginal[best_idx]), float(individual[best_idx])))
+        already_won |= wins[best_idx]
+
+    return selected
+
+
 def optimize_pool_bracket(
     teams_df: pd.DataFrame,
     games_df: pd.DataFrame,
-    pool_size: int = 50,
+    pool_sizes: list[int] | int = 50,
+    pool_size: int | None = None,
     n_candidates: int = 300,
     n_outcomes: int = 2000,
     seed: int = 42,
@@ -296,9 +339,16 @@ def optimize_pool_bracket(
     opponent_mix: dict[str, float] | None = None,
     opponent_safe_seed_chalk_share: float = 0.0,
     opponent_seed_popularity: PopularityTable | None = None,
+    r64_odds: R64OddsTable | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if pool_size < 2:
-        raise ValueError("pool_size must be at least 2")
+    # Backward-compatible: old callers may pass pool_size= as a keyword arg
+    if pool_size is not None:
+        pool_sizes = pool_size
+    _pool_sizes: list[int] = [pool_sizes] if isinstance(pool_sizes, int) else list(pool_sizes)
+    n_entries = len(_pool_sizes)
+    for ps in _pool_sizes:
+        if ps < 2:
+            raise ValueError("Each pool size must be at least 2")
     if n_candidates < 1:
         raise ValueError("n_candidates must be at least 1")
     if n_outcomes < 1:
@@ -335,6 +385,7 @@ def optimize_pool_bracket(
             strategy,
             strategy,
             opponent_seed_popularity,
+            r64_odds,
         )
         key = tuple(picks)
         if key not in candidate_store:
@@ -352,7 +403,34 @@ def optimize_pool_bracket(
     rounds_template = list(candidates[0].rounds)
     weight_vector = [int(round_points.get(round_name, 0)) for round_name in rounds_template]
 
-    for _ in range(n_outcomes):
+    n_cands = len(candidates)
+    scores_matrix = np.empty((n_cands, n_outcomes), dtype=np.int32)
+    opp_max_matrix = np.empty((n_entries, n_outcomes), dtype=np.int32)
+    opp_ties_matrix = np.empty((n_entries, n_outcomes), dtype=np.int32)
+
+    def _simulate_opponent(truth_picks: list[str]) -> int:
+        """Simulate one opponent and return (score, picks) — inline helper."""
+        opp_strategy = str(rng.choice(strategy_names, p=opponent_weights))
+        if opp_strategy == "safe" and rng.random() < opponent_safe_seed_chalk_share:
+            opp_strategy = "safe_seeded"
+        _, opp_picks, _ = _simulate_bracket_rows(
+            regions,
+            region_games,
+            ratings,
+            tempos,
+            seeds,
+            sigma70,
+            spread_a,
+            spread_b,
+            rng,
+            strategy=opp_strategy,
+            strategy_label=opp_strategy,
+            seed_popularity=opponent_seed_popularity,
+            r64_odds=r64_odds,
+        )
+        return _score_picks(opp_picks, truth_picks, weight_vector)
+
+    for i in range(n_outcomes):
         _, truth_picks, _ = _simulate_bracket_rows(
             regions,
             region_games,
@@ -366,58 +444,50 @@ def optimize_pool_bracket(
             strategy=None,
             strategy_label="truth",
             seed_popularity=None,
+            r64_odds=r64_odds,
         )
 
-        opponent_scores = []
-        for _ in range(pool_size - 1):
-            opp_strategy = str(rng.choice(strategy_names, p=opponent_weights))
-            if opp_strategy == "safe" and rng.random() < opponent_safe_seed_chalk_share:
-                opp_strategy = "safe_seeded"
-            _, opp_picks, _ = _simulate_bracket_rows(
-                regions,
-                region_games,
-                ratings,
-                tempos,
-                seeds,
-                sigma70,
-                spread_a,
-                spread_b,
-                rng,
-                strategy=opp_strategy,
-                strategy_label=opp_strategy,
-                seed_popularity=opponent_seed_popularity,
-            )
-            opponent_scores.append(_score_picks(opp_picks, truth_picks, weight_vector))
+        # Candidate scores for this outcome
+        for c_idx, candidate in enumerate(candidates):
+            scores_matrix[c_idx, i] = _score_picks(list(candidate.picks), truth_picks, weight_vector)
 
-        opponent_max = max(opponent_scores)
-        opponent_ties = sum(1 for score in opponent_scores if score == opponent_max)
+        # Per-pool opponent simulation (independent draw per pool)
+        for k, ps in enumerate(_pool_sizes):
+            opp_scores = [_simulate_opponent(truth_picks) for _ in range(ps - 1)]
+            opp_max = max(opp_scores)
+            opp_max_matrix[k, i] = opp_max
+            opp_ties_matrix[k, i] = sum(1 for s in opp_scores if s == opp_max)
 
-        for candidate in candidates:
-            candidate_score = _score_picks(list(candidate.picks), truth_picks, weight_vector)
-            if candidate_score > opponent_max:
-                candidate.first_place_equity += 1.0
-                candidate.win_rate += 1.0
-            elif candidate_score == opponent_max:
-                candidate.first_place_equity += 1.0 / (opponent_ties + 1)
-                candidate.top_tie_rate += 1.0
+    # Accumulate per-candidate equity vs pool 0 for the summary ranking
+    opp_max_0 = opp_max_matrix[0]
+    opp_ties_0 = opp_ties_matrix[0]
+    for c_idx, candidate in enumerate(candidates):
+        cscores = scores_matrix[c_idx]
+        wins = int(np.sum(cscores > opp_max_0))
+        ties = np.where(cscores == opp_max_0)[0]
+        candidate.first_place_equity = (wins + sum(1.0 / (opp_ties_0[t] + 1) for t in ties)) / n_outcomes
+        candidate.win_rate = wins / n_outcomes
+        candidate.top_tie_rate = len(ties) / n_outcomes
 
-    for candidate in candidates:
-        candidate.first_place_equity /= n_outcomes
-        candidate.win_rate /= n_outcomes
-        candidate.top_tie_rate /= n_outcomes
+    selected = _greedy_portfolio_select(scores_matrix, opp_max_matrix, opp_ties_matrix)
+
+    cumulative = 0.0
+    all_rows = []
+    for entry_rank, (c_idx, marginal_eq, individual_eq) in enumerate(selected, start=1):
+        candidate = candidates[c_idx]
+        cumulative += marginal_eq
+        for row in candidate.rows:
+            out_row = dict(row)
+            out_row["Strategy"] = "optimized"
+            out_row["EntryRank"] = entry_rank
+            out_row["PoolSize"] = _pool_sizes[entry_rank - 1]
+            out_row["CandidateStrategy"] = candidate.strategy
+            out_row["IndividualEquity"] = round(individual_eq, 6)
+            out_row["MarginalPortfolioEquity"] = round(marginal_eq, 6)
+            out_row["CumulativePortfolioEquity"] = round(cumulative, 6)
+            all_rows.append(out_row)
 
     ranked = sorted(candidates, key=lambda row: row.first_place_equity, reverse=True)
-    best = ranked[0]
-    best_rows = []
-    for row in best.rows:
-        out_row = dict(row)
-        out_row["Strategy"] = "optimized"
-        out_row["CandidateStrategy"] = best.strategy
-        out_row["FirstPlaceEquity"] = round(best.first_place_equity, 6)
-        out_row["WinOutrightRate"] = round(best.win_rate, 6)
-        out_row["TopTieRate"] = round(best.top_tie_rate, 6)
-        best_rows.append(out_row)
-
     summary_rows = []
     for index, candidate in enumerate(ranked[:25], start=1):
         summary_rows.append(
@@ -430,7 +500,7 @@ def optimize_pool_bracket(
             }
         )
 
-    return pd.DataFrame(best_rows), pd.DataFrame(summary_rows)
+    return pd.DataFrame(all_rows), pd.DataFrame(summary_rows)
 
 
 def _sort_region_games(games_df: pd.DataFrame) -> dict[str, list[tuple[str, str]]]:
@@ -495,6 +565,7 @@ def _simulate_bracket_rows(
     strategy: str | None,
     strategy_label: str,
     seed_popularity: PopularityTable | None,
+    r64_odds: R64OddsTable | None = None,
 ) -> tuple[list[dict[str, str | int | float]], list[str], list[str]]:
     rows: list[dict[str, str | int | float]] = []
     regional_champs: list[str] = []
@@ -515,6 +586,7 @@ def _simulate_bracket_rows(
                 spread_b,
                 rng,
                 seed_popularity,
+                r64_odds,
             )
             rows.append(
                 _pick_row(
@@ -670,6 +742,7 @@ def _select_game_winner(
     spread_b: float,
     rng: np.random.Generator,
     seed_popularity: PopularityTable | None,
+    r64_odds: R64OddsTable | None = None,
 ) -> tuple[str, float, float]:
     base_p_a = win_probability(
         ratings.get(team_a, 0.0),
@@ -680,6 +753,11 @@ def _select_game_winner(
         spread_a=spread_a,
         spread_b=spread_b,
     )
+    if r64_odds is not None and round_name == "R64":
+        key = frozenset({team_a, team_b})
+        if key in r64_odds:
+            fav_name, p_fav = r64_odds[key]
+            base_p_a = p_fav if team_a == fav_name else 1.0 - p_fav
 
     if strategy is None:
         winner = team_a if rng.random() < base_p_a else team_b
@@ -768,6 +846,7 @@ def _simulate_game(
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
+    r64_odds: R64OddsTable | None = None,
 ) -> str:
     p_a = win_probability(
         ratings.get(team_a, 0.0),
@@ -778,6 +857,11 @@ def _simulate_game(
         spread_a=spread_a,
         spread_b=spread_b,
     )
+    if r64_odds is not None:
+        key = frozenset({team_a, team_b})
+        if key in r64_odds:
+            fav_name, p_fav = r64_odds[key]
+            p_a = p_fav if team_a == fav_name else 1.0 - p_fav
     return team_a if rng.random() < p_a else team_b
 
 
@@ -792,6 +876,7 @@ def _simulate_game_with_strategy(
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
+    r64_odds: R64OddsTable | None = None,
 ) -> tuple[str, float, float]:
     base_p_a = win_probability(
         ratings.get(team_a, 0.0),
@@ -802,6 +887,11 @@ def _simulate_game_with_strategy(
         spread_a=spread_a,
         spread_b=spread_b,
     )
+    if r64_odds is not None and round_name == "R64":
+        key = frozenset({team_a, team_b})
+        if key in r64_odds:
+            fav_name, p_fav = r64_odds[key]
+            base_p_a = p_fav if team_a == fav_name else 1.0 - p_fav
     randomness = STRATEGY_RANDOMNESS[strategy].get(round_name, 0.0)
 
     p_favorite = max(base_p_a, 1.0 - base_p_a)
@@ -822,6 +912,7 @@ def _run_strategy_once(
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
+    r64_odds: R64OddsTable | None = None,
 ) -> list[dict[str, str | int | float]]:
     rows: list[dict[str, str | int | float]] = []
     regional_champs: list[str] = []
@@ -830,7 +921,7 @@ def _run_strategy_once(
         current_teams: list[str] = []
         for game_index, (team_a, team_b) in enumerate(region_games[region], start=1):
             winner, base_p_a, adjusted_p_a = _simulate_game_with_strategy(
-                team_a, team_b, ratings, tempos, strategy, "R64", sigma70, spread_a, spread_b, rng
+                team_a, team_b, ratings, tempos, strategy, "R64", sigma70, spread_a, spread_b, rng, r64_odds
             )
             rows.append(
                 _pick_row(

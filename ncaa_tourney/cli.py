@@ -20,10 +20,13 @@ from ncaa_tourney.rankings import (
     create_tempo_template,
     load_rankings_espn_bpi,
     load_rankings_manual_csv,
+    load_rankings_kenpom_html,
+    load_rankings_kenpom_public,
     load_tempo_kenpom_html,
     load_tempo_kenpom_public,
     load_tempo_manual_csv,
     merge_rankings_with_tempo,
+    overlay_kenpom_ratings,
 )
 from ncaa_tourney.simulation import simulate_tournament
 from ncaa_tourney.simulation import generate_strategy_brackets
@@ -44,7 +47,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bracket.add_argument("--out", required=True)
 
     p_build = sub.add_parser("build-dataset")
-    p_build.add_argument("--rankings-source", choices=["manual_csv", "espn_bpi"], required=True)
+    p_build.add_argument("--rankings-source", choices=["manual_csv", "espn_bpi", "merged_report", "kenpom_html", "kenpom_public"], required=True)
     p_build.add_argument("--rankings-path", default="")
     p_build.add_argument(
         "--tempo-source",
@@ -62,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_build.add_argument("--out-games", required=True)
 
     p_check = sub.add_parser("check-sources")
-    p_check.add_argument("--rankings-source", choices=["manual_csv", "espn_bpi"], required=True)
+    p_check.add_argument("--rankings-source", choices=["manual_csv", "espn_bpi", "kenpom_html", "kenpom_public"], required=True)
     p_check.add_argument("--rankings-path", default="")
     p_check.add_argument(
         "--tempo-source",
@@ -86,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_sim.add_argument("--spread-b", type=float, default=12.99)
     p_sim.add_argument("--out-summary", required=True)
     p_sim.add_argument("--out-brackets", required=True)
+    p_sim.add_argument("--r64-odds", default="")
 
     p_picks = sub.add_parser("make-picks")
     p_picks.add_argument("--teams", required=True)
@@ -93,12 +97,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_picks.add_argument("--seed", type=int, default=42)
     p_picks.add_argument("--spread-a", type=float, default=-0.78)
     p_picks.add_argument("--spread-b", type=float, default=12.99)
+    p_picks.add_argument("--r64-odds", default="")
     p_picks.add_argument("--out", required=True)
 
     p_opt = sub.add_parser("optimize-picks")
     p_opt.add_argument("--teams", required=True)
     p_opt.add_argument("--games", required=True)
-    p_opt.add_argument("--pool-size", type=int, default=50)
+    p_opt.add_argument("--pool-size", type=str, default="50")
     p_opt.add_argument("--n-candidates", type=int, default=300)
     p_opt.add_argument("--n-outcomes", type=int, default=2000)
     p_opt.add_argument("--seed", type=int, default=42)
@@ -109,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_opt.add_argument("--opponent-mix", default="0.5,0.35,0.15")
     p_opt.add_argument("--opponent-safe-seed-chalk-share", type=float, default=0.0)
     p_opt.add_argument("--opponent-seed-popularity", default="")
+    p_opt.add_argument("--r64-odds", default="")
     p_opt.add_argument("--out", required=True)
     p_opt.add_argument("--out-summary", required=True)
 
@@ -138,18 +144,30 @@ def main() -> None:
         return
 
     if args.command == "build-dataset":
-        rankings = _load_rankings(args.rankings_source, args.rankings_path)
-
-        if args.tempo_source != "none":
-            tempo = _load_tempo(args.tempo_source, args.tempo_path, args.tempo_url)
-            rankings = merge_rankings_with_tempo(
-                rankings,
-                tempo,
-                min_similarity=args.team_match_threshold,
-                default_tempo=args.default_tempo,
-            )
+        # Support using a previously-generated merged source report directly.
+        if args.rankings_source == "merged_report":
+            if not args.rankings_path:
+                raise ValueError("--rankings-path required for merged_report")
+            merged = pd.read_csv(args.rankings_path)
+            required = {"Team", "Rating", "Source", "Tempo"}
+            missing = required - set(merged.columns)
+            if missing:
+                missing_cols = ", ".join(sorted(missing))
+                raise ValueError(f"Merged report is missing required columns: {missing_cols}")
+            rankings = merged.copy()
         else:
-            rankings = _apply_default_tempo(rankings, args.default_tempo)
+            rankings = _load_rankings(args.rankings_source, args.rankings_path)
+
+            if args.tempo_source != "none":
+                tempo = _load_tempo(args.tempo_source, args.tempo_path, args.tempo_url)
+                rankings = merge_rankings_with_tempo(
+                    rankings,
+                    tempo,
+                    min_similarity=args.team_match_threshold,
+                    default_tempo=args.default_tempo,
+                )
+            else:
+                rankings = _apply_default_tempo(rankings, args.default_tempo)
 
         if args.bracket_source == "manual_csv":
             if not args.bracket_path:
@@ -180,6 +198,7 @@ def main() -> None:
             seed=args.seed,
             spread_a=args.spread_a,
             spread_b=args.spread_b,
+            r64_odds=_load_r64_odds(args.r64_odds),
         )
 
         ensure_parent(args.out_summary)
@@ -199,6 +218,7 @@ def main() -> None:
             seed=args.seed,
             spread_a=args.spread_a,
             spread_b=args.spread_b,
+            r64_odds=_load_r64_odds(args.r64_odds),
         )
 
         ensure_parent(args.out)
@@ -214,10 +234,13 @@ def main() -> None:
         opponent_mix = _parse_strategy_mix(args.opponent_mix)
         opponent_seed_popularity = _load_seed_popularity(args.opponent_seed_popularity)
 
+        pool_sizes = _parse_pool_sizes(args.pool_size)
+        r64_odds = _load_r64_odds(args.r64_odds)
+
         picks, summary = optimize_pool_bracket(
             teams,
             games,
-            pool_size=args.pool_size,
+            pool_sizes=pool_sizes,
             n_candidates=args.n_candidates,
             n_outcomes=args.n_outcomes,
             seed=args.seed,
@@ -228,6 +251,7 @@ def main() -> None:
             opponent_mix=opponent_mix,
             opponent_safe_seed_chalk_share=args.opponent_safe_seed_chalk_share,
             opponent_seed_popularity=opponent_seed_popularity,
+            r64_odds=r64_odds,
         )
 
         ensure_parent(args.out)
@@ -248,7 +272,6 @@ def main() -> None:
             min_similarity=args.team_match_threshold,
             default_tempo=args.default_tempo,
         )
-
         ensure_parent(args.out_report)
         merged.to_csv(args.out_report, index=False)
 
@@ -277,11 +300,22 @@ def main() -> None:
     raise RuntimeError(f"Unknown command: {args.command}")
 
 
+
 def _load_rankings(source: str, path: str) -> pd.DataFrame:
     if source == "manual_csv":
         if not path:
             raise ValueError("--rankings-path required for manual_csv")
         return load_rankings_manual_csv(path)
+    if source == "kenpom_public":
+        espn_base = load_rankings_espn_bpi()
+        kenpom = load_rankings_kenpom_public()
+        return overlay_kenpom_ratings(espn_base, kenpom)
+    if source == "kenpom_html":
+        if not path:
+            raise ValueError("--rankings-path required for kenpom_html")
+        espn_base = load_rankings_espn_bpi()
+        kenpom = load_rankings_kenpom_html(path)
+        return overlay_kenpom_ratings(espn_base, kenpom)
     return load_rankings_espn_bpi()
 
 
@@ -315,6 +349,15 @@ def _derive_output_path(base_path: str, suffix: str) -> str:
     return str(path.with_name(filename))
 
 
+def _parse_pool_sizes(value: str) -> list[int]:
+    tokens = [token.strip() for token in value.split(",") if token.strip()]
+    sizes = [int(token) for token in tokens]
+    for s in sizes:
+        if s < 2:
+            raise ValueError("Each pool size must be at least 2")
+    return sizes
+
+
 def _parse_round_points(value: str) -> dict[str, int]:
     tokens = [token.strip() for token in value.split(",") if token.strip()]
     if len(tokens) != 6:
@@ -336,6 +379,21 @@ def _parse_strategy_mix(value: str) -> dict[str, float]:
         "balanced": balanced,
         "upset_heavy": upset_heavy,
     }
+
+
+def _load_r64_odds(path: str) -> dict[frozenset[str], tuple[str, float]] | None:
+    if not path:
+        return None
+    frame = pd.read_csv(path)
+    required = {"Favorite", "Underdog", "Probability"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"--r64-odds CSV missing columns: {', '.join(sorted(missing))}")
+    result: dict[frozenset[str], tuple[str, float]] = {}
+    for row in frame.itertuples(index=False):
+        key: frozenset[str] = frozenset({str(row.Favorite), str(row.Underdog)})
+        result[key] = (str(row.Favorite), float(row.Probability))
+    return result
 
 
 def _load_seed_popularity(path: str) -> dict[str, dict[tuple[int, int], float]] | None:
