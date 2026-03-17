@@ -121,8 +121,6 @@ python -m ncaa_tourney.cli simulate \
   --games data/processed/round1_games.csv \
   --n-sims 20000 \
   --seed 42 \
-  --spread-a -0.78 \
-  --spread-b 12.99 \
   --out-summary output/simulation_summary.csv \
   --out-brackets output/top_brackets.csv
 
@@ -130,8 +128,6 @@ python -m ncaa_tourney.cli make-picks \
   --teams data/processed/teams.csv \
   --games data/processed/round1_games.csv \
   --seed 42 \
-  --spread-a -0.78 \
-  --spread-b 12.99 \
   --out output/strategy_picks.csv
 
 python -m ncaa_tourney.cli optimize-picks \
@@ -146,8 +142,6 @@ python -m ncaa_tourney.cli optimize-picks \
   --opponent-safe-seed-chalk-share 0.25 \
   --opponent-seed-popularity data/raw/espn_pick_popularity.csv \
   --seed 42 \
-  --spread-a -0.78 \
-  --spread-b 12.99 \
   --out output/optimized_picks.csv \
   --out-summary output/optimized_picks_summary.csv
 ```
