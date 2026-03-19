@@ -114,7 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_opt.add_argument("--opponent-mix", default="0.5,0.35,0.15")
     p_opt.add_argument("--opponent-safe-seed-chalk-share", type=float, default=0.0)
     p_opt.add_argument("--opponent-seed-popularity", default="")
+    p_opt.add_argument("--opponent-teams", default="")
+    p_opt.add_argument("--opponent-team-popularity", default="")
     p_opt.add_argument("--r64-odds", default="")
+    p_opt.add_argument("--payouts", type=str, default="")
     p_opt.add_argument("--out", required=True)
     p_opt.add_argument("--out-summary", required=True)
 
@@ -235,9 +238,12 @@ def main() -> None:
         opponent_seed_popularity = _load_seed_popularity(args.opponent_seed_popularity)
 
         pool_sizes = _parse_pool_sizes(args.pool_size)
+        pool_payouts = _parse_payouts(args.payouts, pool_sizes) if args.payouts else None
         r64_odds = _load_r64_odds(args.r64_odds)
+        opponent_teams = pd.read_csv(args.opponent_teams) if args.opponent_teams else None
+        opponent_team_popularity = _load_team_popularity(args.opponent_team_popularity)
 
-        picks, summary = optimize_pool_bracket(
+        picks, summary, candidates = optimize_pool_bracket(
             teams,
             games,
             pool_sizes=pool_sizes,
@@ -252,14 +258,21 @@ def main() -> None:
             opponent_safe_seed_chalk_share=args.opponent_safe_seed_chalk_share,
             opponent_seed_popularity=opponent_seed_popularity,
             r64_odds=r64_odds,
+            opponent_teams_df=opponent_teams,
+            opponent_team_popularity=opponent_team_popularity,
+            pool_payouts=pool_payouts,
         )
 
+        from pathlib import Path
+        candidates_path = str(Path(args.out_summary).with_stem(Path(args.out_summary).stem + "_candidates"))
         ensure_parent(args.out)
         ensure_parent(args.out_summary)
         picks.to_csv(args.out, index=False)
         summary.to_csv(args.out_summary, index=False)
+        candidates.to_csv(candidates_path, index=False)
         print(f"Wrote optimized picks to {args.out}")
-        print(f"Wrote optimizer summary to {args.out_summary}")
+        print(f"Wrote entry summary to {args.out_summary}")
+        print(f"Wrote candidate ranking to {candidates_path}")
         return
 
     if args.command == "check-sources":
@@ -349,6 +362,16 @@ def _derive_output_path(base_path: str, suffix: str) -> str:
     return str(path.with_name(filename))
 
 
+def _parse_payouts(value: str, pool_sizes: list[int]) -> list[float]:
+    tokens = [token.strip() for token in value.split(",") if token.strip()]
+    payouts = [float(token) for token in tokens]
+    if len(payouts) != len(pool_sizes):
+        raise ValueError(
+            f"--payouts has {len(payouts)} values but --pool-size has {len(pool_sizes)} pools"
+        )
+    return payouts
+
+
 def _parse_pool_sizes(value: str) -> list[int]:
     tokens = [token.strip() for token in value.split(",") if token.strip()]
     sizes = [int(token) for token in tokens]
@@ -425,6 +448,29 @@ def _load_seed_popularity(path: str) -> dict[str, dict[tuple[int, int], float]] 
         if round_name not in table:
             table[round_name] = {}
         table[round_name][(min(seed_favorite, seed_underdog), max(seed_favorite, seed_underdog))] = rate
+
+    return table
+
+
+def _load_team_popularity(path: str) -> dict[str, dict[str, float]] | None:
+    """Load espn_team_popularity.csv → {round: {team_name: probability}}."""
+    if not path:
+        return None
+
+    frame = pd.read_csv(path)
+    required = {"Team", "Round", "Probability"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Team popularity file is missing columns: {', '.join(sorted(missing))}")
+
+    table: dict[str, dict[str, float]] = {}
+    for row in frame.itertuples(index=False):
+        round_name = str(row.Round).strip()
+        team = str(row.Team).strip()
+        prob = pd.to_numeric(getattr(row, "Probability"), errors="coerce")
+        if pd.isna(prob):
+            continue
+        table.setdefault(round_name, {})[team] = float(prob)
 
     return table
 

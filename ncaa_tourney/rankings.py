@@ -114,6 +114,37 @@ MASCOT_SUFFIXES = {
     "mavericks",
     "quakers",
     "great danes",
+    # additional mascots
+    "commodores",
+    "cornhuskers",
+    "red storm",
+    "hawkeyes",
+    "wolverines",
+    "hurricanes",
+    "bruins",
+    "rams",
+    "trojans",
+    "gators",
+    "saints",
+    "bulls",
+    "broncos",
+    "panthers",
+    "cowboys",
+    "paladins",
+    "vandals",
+    "pride",
+    "owls",
+    "redhawks",
+    "bison",
+    "billikens",
+    "gaels",
+    "royals",
+    "zips",
+    "lancers",
+    "warriors",
+    "rainbow warriors",
+    "horned frogs",
+    "red raiders",
 }
 
 TOKEN_REPLACEMENTS = {
@@ -323,6 +354,38 @@ def _parse_kenpom_ratings_tables(html: str, source: str) -> pd.DataFrame:
     )
     out = out.dropna(subset=["Team", "Rating"])
     return _normalize_rankings(out)
+
+
+def load_kenpom_efficiencies(path: str) -> dict[str, tuple[float, float]]:
+    """Parse a KenPom HTML file and return {canonical_key: (AdjO, AdjD)} per 100 possessions.
+
+    Keys are canonical (same as used in overlay_kenpom_ratings), so lookups should
+    also use _resolve_alias(_canonical_team_key(team_name)).
+    """
+    from bs4 import BeautifulSoup
+
+    with open(path, "r", encoding="utf-8") as f:
+        soup = BeautifulSoup(f.read(), "html.parser")
+
+    table = soup.find("table", id="ratings-table")
+    if table is None:
+        raise RuntimeError("Could not find #ratings-table in KenPom HTML")
+
+    result: dict[str, tuple[float, float]] = {}
+    for row in table.find("tbody").find_all("tr"):
+        cells = [td.get_text(strip=True) for td in row.find_all("td")]
+        if len(cells) < 9:
+            continue
+        team = _clean_team_name(cells[1])
+        key = _resolve_alias(_canonical_team_key(team))
+        try:
+            adj_o = float(cells[5])
+            adj_d = float(cells[7])
+        except (ValueError, IndexError):
+            continue
+        result[key] = (adj_o, adj_d)
+
+    return result
 
 
 def overlay_kenpom_ratings(
@@ -535,7 +598,7 @@ def _normalize_tempo(df: pd.DataFrame) -> pd.DataFrame:
 def _clean_team_name(name: str) -> str:
     cleaned = str(name)
     cleaned = re.sub(r"^\d+\s+", "", cleaned)
-    cleaned = re.sub(r"\s+\d+$", "", cleaned)
+    cleaned = re.sub(r"\s*\d+$", "", cleaned)
     cleaned = re.sub(r"\s+\(\d+-\d+\)$", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned

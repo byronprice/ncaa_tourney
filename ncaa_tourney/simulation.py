@@ -37,6 +37,12 @@ DEFAULT_ROUND_POINTS = {
 
 PopularityTable = dict[str, dict[tuple[int, int], float]]
 
+# Maps round -> {team_name -> public_pick_probability}
+# Used for F4/NCG/Champ where seed-based lookup no longer identifies teams uniquely.
+# F4 game: use NCG probabilities (% of public picking team to reach the title game)
+# NCG game: use Champ probabilities (% of public picking team to win it all)
+TeamPopularityTable = dict[str, dict[str, float]]
+
 SEED_CHALK_UNDERDOG_PROBS_BY_ROUND = {
     "R64": {
         (1, 16): 0.01,
@@ -113,6 +119,9 @@ SEED_CHALK_UNDERDOG_PROBS_BY_ROUND = {
     },
 }
 
+# to run optimize-picks
+#  python -m ncaa_tourney.cli optimize-picks --teams data/processed/teams.csv --opponent-teams output/source_link_report_espn.csv --games data/processed/round1_games.csv --r64-odds data/raw/round1_game_odds.csv --pool-size 30,30 --n-candidates 1000 --n-outcomes 5000 --round-points 1,2,4,8,16,32 --candidate-mix 0.20,0.30,0.50 --opponent-mix 0.5,0.4,0.1 --opponent-safe-seed-chalk-share 0.25 --opponent-seed-popularity data/raw/espn_pick_popularity.csv --opponent-team-popularity data/raw/espn_team_popularity.csv --seed 53 --out output/optimized_picks.csv --out-summary output/optimized_picks_summary.csv
+
 
 @dataclass
 class CandidateBracket:
@@ -147,6 +156,57 @@ def win_probability(
     return float(np.clip(p_a, 0.01, 0.99))
 
 
+def estimate_championship_total(
+    team_a: str,
+    team_b: str,
+    teams_df: pd.DataFrame,
+    efficiencies: dict[str, tuple[float, float]] | None = None,
+    national_avg_eff: float = 103.0,
+    national_avg_tempo: float = NATIONAL_AVG_TEMPO,
+) -> dict:
+    """Estimate the total score of a game for tiebreaker purposes.
+
+    If `efficiencies` is provided (from load_kenpom_efficiencies), actual AdjO/AdjD
+    per 100 possessions are used.  Scoring uses the standard KenPom formula:
+        score_A = AdjO_A * (AdjD_B / national_avg_eff) * (possessions / 100)
+    """
+    def _get_row(name: str) -> pd.Series:
+        rows = teams_df[teams_df["Team"] == name]
+        if rows.empty:
+            raise ValueError(f"Team not found: {name!r}")
+        return rows.iloc[0]
+
+    row_a, row_b = _get_row(team_a), _get_row(team_b)
+
+    if efficiencies is None:
+        raise ValueError("efficiencies dict is required — use load_kenpom_efficiencies()")
+
+    from ncaa_tourney.rankings import _canonical_team_key, _resolve_alias
+
+    def _lookup_eff(name: str) -> tuple[float, float]:
+        key = _resolve_alias(_canonical_team_key(name))
+        if key not in efficiencies:
+            raise ValueError(f"No efficiency data for {name!r} (canonical key: {key!r})")
+        return efficiencies[key]
+
+    adj_o_a, adj_d_a = _lookup_eff(team_a)
+    adj_o_b, adj_d_b = _lookup_eff(team_b)
+
+    possessions = max(float(row_a["Tempo"]) + float(row_b["Tempo"]) - national_avg_tempo, 55.0)
+
+    score_a = adj_o_a * (adj_d_b / national_avg_eff) * (possessions / 100.0)
+    score_b = adj_o_b * (adj_d_a / national_avg_eff) * (possessions / 100.0)
+
+    return {
+        "team_a": team_a,  "score_a": round(score_a, 1),
+        "team_b": team_b,  "score_b": round(score_b, 1),
+        "total":  round(score_a + score_b, 1),
+        "possessions": round(possessions, 1),
+        "adj_o_a": round(adj_o_a, 1), "adj_d_a": round(adj_d_a, 1),
+        "adj_o_b": round(adj_o_b, 1), "adj_d_b": round(adj_d_b, 1),
+    }
+
+
 def simulate_tournament(
     teams_df: pd.DataFrame,
     games_df: pd.DataFrame,
@@ -169,8 +229,10 @@ def simulate_tournament(
     if len(regions) != 4:
         print(f"Warning: expected 4 regions, found {len(regions)}")
 
+    f4_region_order = ["East", "South", "Midwest", "West"]
+
     for _ in range(n_sims):
-        regional_champs = []
+        champs_by_region: dict[str, str] = {}
         full_path = []
 
         for region in regions:
@@ -224,7 +286,9 @@ def simulate_tournament(
                 region,
                 "E8",
             )
-            regional_champs.extend(e8_winner)
+            champs_by_region[region] = e8_winner[0]
+
+        regional_champs = [champs_by_region[r] for r in f4_region_order if r in champs_by_region]
 
         f4_winners = _play_round(
             regional_champs,
@@ -292,35 +356,57 @@ def _greedy_portfolio_select(
     scores_matrix: np.ndarray,
     opp_max_matrix: np.ndarray,
     opp_ties_matrix: np.ndarray,
+    pool_weights: list[float] | None = None,
 ) -> list[tuple[int, float, float]]:
-    """Greedy sequential bracket selection maximizing P(at least one entry wins its pool).
+    """Weighted global greedy bracket selection across all pools.
 
-    Returns a list of (candidate_idx, marginal_equity, individual_equity) — one per entry/pool.
-    Each bracket is assigned to the pool at the same index in opp_max_matrix.
+    At each step, picks the (pool, candidate) pair with the highest
+    weight * marginal_equity, where weight = payout / pool_size.
+    This ensures high-EV pools get priority access to the best candidates
+    regardless of their position in the pool list.
+
+    Returns a list of (candidate_idx, marginal_equity, individual_equity)
+    ordered by pool index (not assignment order).
     """
     n_entries = opp_max_matrix.shape[0]
     n_outcomes = scores_matrix.shape[1]
+    weights = pool_weights if pool_weights is not None else [1.0] * n_entries
     already_won = np.zeros(n_outcomes, dtype=bool)
-    selected: list[tuple[int, float, float]] = []
+    assigned: list[tuple[int, float, float] | None] = [None] * n_entries
+    unassigned = list(range(n_entries))
 
-    for k in range(n_entries):
-        opp_max_k = opp_max_matrix[k]
-        opp_ties_k = opp_ties_matrix[k]
+    while unassigned:
+        best_weighted = -1.0
+        best_pool = -1
+        best_candidate = -1
+        best_marginal = 0.0
+        best_individual = 0.0
 
-        wins = scores_matrix > opp_max_k[np.newaxis, :]
-        tie_mask = scores_matrix == opp_max_k[np.newaxis, :]
-        tie_vals = np.where(tie_mask, 1.0 / (opp_ties_k[np.newaxis, :].astype(np.float64) + 1.0), 0.0)
-        equity_per_outcome = wins.astype(np.float64) + tie_vals
+        for k in unassigned:
+            opp_max_k = opp_max_matrix[k]
+            opp_ties_k = opp_ties_matrix[k]
+            wins = scores_matrix > opp_max_k[np.newaxis, :]
+            tie_mask = scores_matrix == opp_max_k[np.newaxis, :]
+            tie_vals = np.where(tie_mask, 1.0 / (opp_ties_k[np.newaxis, :].astype(np.float64) + 1.0), 0.0)
+            equity = wins.astype(np.float64) + tie_vals
+            uncovered = ~already_won
+            marginal = (equity * uncovered[np.newaxis, :]).mean(axis=1)
+            individual = equity.mean(axis=1)
+            best_c = int(np.argmax(marginal))
+            weighted = weights[k] * float(marginal[best_c])
+            if weighted > best_weighted:
+                best_weighted = weighted
+                best_pool = k
+                best_candidate = best_c
+                best_marginal = float(marginal[best_c])
+                best_individual = float(individual[best_c])
 
-        uncovered = ~already_won
-        marginal = (equity_per_outcome * uncovered[np.newaxis, :]).mean(axis=1)
-        individual = equity_per_outcome.mean(axis=1)
+        assigned[best_pool] = (best_candidate, best_marginal, best_individual)
+        wins_k = scores_matrix[best_candidate] > opp_max_matrix[best_pool]
+        already_won |= wins_k
+        unassigned.remove(best_pool)
 
-        best_idx = int(np.argmax(marginal))
-        selected.append((best_idx, float(marginal[best_idx]), float(individual[best_idx])))
-        already_won |= wins[best_idx]
-
-    return selected
+    return [a for a in assigned if a is not None]
 
 
 def optimize_pool_bracket(
@@ -340,6 +426,9 @@ def optimize_pool_bracket(
     opponent_safe_seed_chalk_share: float = 0.0,
     opponent_seed_popularity: PopularityTable | None = None,
     r64_odds: R64OddsTable | None = None,
+    opponent_teams_df: pd.DataFrame | None = None,
+    opponent_team_popularity: TeamPopularityTable | None = None,
+    pool_payouts: list[float] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     # Backward-compatible: old callers may pass pool_size= as a keyword arg
     if pool_size is not None:
@@ -358,6 +447,9 @@ def optimize_pool_bracket(
 
     ratings = dict(zip(teams_df["Team"], teams_df["Rating"]))
     tempos = _build_tempo_map(teams_df)
+    opp_df = opponent_teams_df if opponent_teams_df is not None else teams_df
+    opponent_ratings = dict(zip(opp_df["Team"], opp_df["Rating"]))
+    opponent_tempos = _build_tempo_map(opp_df)
     seeds = _build_seed_map(games_df)
     region_games = _sort_region_games(games_df)
     regions = sorted(region_games.keys())
@@ -416,8 +508,8 @@ def optimize_pool_bracket(
         _, opp_picks, _ = _simulate_bracket_rows(
             regions,
             region_games,
-            ratings,
-            tempos,
+            opponent_ratings,
+            opponent_tempos,
             seeds,
             sigma70,
             spread_a,
@@ -426,7 +518,8 @@ def optimize_pool_bracket(
             strategy=opp_strategy,
             strategy_label=opp_strategy,
             seed_popularity=opponent_seed_popularity,
-            r64_odds=r64_odds,
+            r64_odds=None,
+            team_popularity=opponent_team_popularity,
         )
         return _score_picks(opp_picks, truth_picks, weight_vector)
 
@@ -469,7 +562,11 @@ def optimize_pool_bracket(
         candidate.win_rate = wins / n_outcomes
         candidate.top_tie_rate = len(ties) / n_outcomes
 
-    selected = _greedy_portfolio_select(scores_matrix, opp_max_matrix, opp_ties_matrix)
+    _payouts = list(pool_payouts) if pool_payouts is not None else [1.0] * n_entries
+    if len(_payouts) != n_entries:
+        raise ValueError(f"pool_payouts length {len(_payouts)} must match number of pools {n_entries}")
+    pool_weights = [p / ps for p, ps in zip(_payouts, _pool_sizes)]
+    selected = _greedy_portfolio_select(scores_matrix, opp_max_matrix, opp_ties_matrix, pool_weights)
 
     cumulative = 0.0
     all_rows = []
@@ -487,10 +584,33 @@ def optimize_pool_bracket(
             out_row["CumulativePortfolioEquity"] = round(cumulative, 6)
             all_rows.append(out_row)
 
+    # Per-entry summary: one row per assigned entry showing pool context and champion pick
+    entry_summary_rows = []
+    for entry_rank, (c_idx, marginal_eq, individual_eq) in enumerate(selected, start=1):
+        candidate = candidates[c_idx]
+        ps = _pool_sizes[entry_rank - 1]
+        payout = _payouts[entry_rank - 1]
+        champ_row = next((r for r in candidate.rows if r.get("Round") == "Champ"), None)
+        champion = champ_row["Pick"] if champ_row else ""
+        entry_summary_rows.append(
+            {
+                "EntryRank": entry_rank,
+                "PoolSize": ps,
+                "Payout": payout,
+                "EVWeight": round(payout / ps, 4),
+                "Champion": champion,
+                "CandidateStrategy": candidate.strategy,
+                "IndividualEquity": round(individual_eq, 6),
+                "MarginalPortfolioEquity": round(marginal_eq, 6),
+                "CumulativePortfolioEquity": round(cumulative, 6),
+            }
+        )
+
+    # Candidate summary: top 25 by first-place equity vs pool 0
     ranked = sorted(candidates, key=lambda row: row.first_place_equity, reverse=True)
-    summary_rows = []
+    candidate_summary_rows = []
     for index, candidate in enumerate(ranked[:25], start=1):
-        summary_rows.append(
+        candidate_summary_rows.append(
             {
                 "Rank": index,
                 "FirstPlaceEquity": round(candidate.first_place_equity, 6),
@@ -500,7 +620,112 @@ def optimize_pool_bracket(
             }
         )
 
-    return pd.DataFrame(all_rows), pd.DataFrame(summary_rows)
+    return pd.DataFrame(all_rows), pd.DataFrame(entry_summary_rows), pd.DataFrame(candidate_summary_rows)
+
+
+def _sample_forced_f4_teams(
+    team_popularity: TeamPopularityTable,
+    region_games: dict[str, list[tuple[str, str]]],
+    ratings: dict[str, float],
+    rng: np.random.Generator,
+) -> tuple[dict[str, str], str | None]:
+    """Backward-sample forced regional champions to match ESPN public pick popularity.
+
+    Algorithm:
+      1. Sample champion from Champ% (all tournament teams eligible; unlisted → BPI weight)
+      2. Sample NCG opponent from NCG% restricted to the opposite bracket half
+      3. Sample the two F4 losers from F4% restricted to their individual remaining regions
+
+    Returns (forced_regional_champs, forced_champion):
+      - forced_regional_champs: {region: team} for all 4 regions
+      - forced_champion: the team that must also win F4 and NCG
+    """
+    from ncaa_tourney.rankings import _canonical_team_key, _resolve_alias
+
+    region_to_teams: dict[str, set[str]] = {}
+    for region, games in region_games.items():
+        ts: set[str] = set()
+        for a, b in games:
+            ts.add(a)
+            ts.add(b)
+        region_to_teams[region] = ts
+
+    all_game_teams = {t for ts in region_to_teams.values() for t in ts}
+    canon_to_game: dict[str, str] = {}
+    for t in all_game_teams:
+        key = _resolve_alias(_canonical_team_key(t))
+        canon_to_game[key] = t
+
+    def get_weights(round_name: str, eligible: set[str]) -> dict[str, float]:
+        pop = team_popularity.get(round_name, {})
+        weights: dict[str, float] = {}
+        listed_in: set[str] = set()
+        listed_sum = 0.0
+        for pop_name, prob in pop.items():
+            key = _resolve_alias(_canonical_team_key(pop_name))
+            game_name = canon_to_game.get(key)
+            if game_name and game_name in eligible:
+                weights[game_name] = float(prob)
+                listed_sum += float(prob)
+                listed_in.add(game_name)
+        unlisted = eligible - listed_in
+        if unlisted:
+            residual = max(0.0, 1.0 - listed_sum)
+            bpi_sum = sum(max(ratings.get(t, 0.0), 0.0) for t in unlisted)
+            if residual > 0.0 and bpi_sum > 0.0:
+                for t in unlisted:
+                    weights[t] = (max(ratings.get(t, 0.0), 0.0) / bpi_sum) * residual
+            elif bpi_sum > 0.0:
+                # Listed teams exhausted the mass — give unlisted a tiny BPI-proportional weight
+                for t in unlisted:
+                    weights[t] = (max(ratings.get(t, 0.0), 0.0) / bpi_sum) * 1e-4
+            else:
+                for t in unlisted:
+                    weights[t] = 1e-4 / len(unlisted)
+        return weights
+
+    def draw(weights: dict[str, float]) -> str:
+        teams_list = list(weights.keys())
+        if not teams_list:
+            return ""
+        w = np.array([weights[t] for t in teams_list], dtype=np.float64)
+        total = w.sum()
+        if total <= 0.0:
+            return str(rng.choice(teams_list))
+        w /= total
+        return teams_list[int(rng.choice(len(teams_list), p=w))]
+
+    half_a = ["East", "South"]
+    half_b = ["Midwest", "West"]
+
+    # Step 1: Champion (all teams eligible)
+    champion = draw(get_weights("Champ", all_game_teams))
+    champ_region = next((r for r, ts in region_to_teams.items() if champion in ts), None)
+    if not champ_region:
+        return {}, None
+
+    champ_half = half_a if champ_region in half_a else half_b
+    opp_half = half_b if champ_half == half_a else half_a
+
+    # Step 2: NCG opponent from opposite half
+    opp_half_teams = {t for r in opp_half for t in region_to_teams.get(r, set())}
+    ncg_opponent = draw(get_weights("NCG", opp_half_teams))
+    ncg_region = next((r for r, ts in region_to_teams.items() if ncg_opponent in ts), None)
+
+    forced: dict[str, str] = {champ_region: champion}
+    if ncg_region:
+        forced[ncg_region] = ncg_opponent
+
+    # Step 3: F4 losers — the remaining region in each half
+    champ_other = next((r for r in champ_half if r != champ_region), None)
+    opp_other = next((r for r in opp_half if r != ncg_region), None) if ncg_region else None
+
+    if champ_other:
+        forced[champ_other] = draw(get_weights("F4", region_to_teams.get(champ_other, set())))
+    if opp_other:
+        forced[opp_other] = draw(get_weights("F4", region_to_teams.get(opp_other, set())))
+
+    return forced, champion
 
 
 def _sort_region_games(games_df: pd.DataFrame) -> dict[str, list[tuple[str, str]]]:
@@ -566,11 +791,21 @@ def _simulate_bracket_rows(
     strategy_label: str,
     seed_popularity: PopularityTable | None,
     r64_odds: R64OddsTable | None = None,
+    team_popularity: TeamPopularityTable | None = None,
 ) -> tuple[list[dict[str, str | int | float]], list[str], list[str]]:
     rows: list[dict[str, str | int | float]] = []
-    regional_champs: list[str] = []
+    champs_by_region: dict[str, str] = {}
+
+    # Backward-sample forced F4 teams for safe_seeded opponents when team popularity is available
+    forced_regional_champs: dict[str, str] = {}
+    forced_champion: str | None = None
+    if strategy == "safe_seeded" and team_popularity is not None:
+        forced_regional_champs, forced_champion = _sample_forced_f4_teams(
+            team_popularity, region_games, ratings, rng
+        )
 
     for region in regions:
+        forced_for_region = forced_regional_champs.get(region)
         current_teams: list[str] = []
         for game_index, (team_a, team_b) in enumerate(region_games[region], start=1):
             winner, base_p_a, adjusted_p_a = _select_game_winner(
@@ -587,6 +822,7 @@ def _simulate_bracket_rows(
                 rng,
                 seed_popularity,
                 r64_odds,
+                forced_winner=forced_for_region,
             )
             rows.append(
                 _pick_row(
@@ -618,10 +854,14 @@ def _simulate_bracket_rows(
                 spread_b,
                 rng,
                 seed_popularity,
+                forced_winner=forced_for_region,
             )
             rows.extend(new_rows)
 
-        regional_champs.extend(current_teams)
+        champs_by_region[region] = current_teams[0]
+
+    f4_region_order = ["East", "South", "Midwest", "West"]
+    regional_champs = [champs_by_region[r] for r in f4_region_order if r in champs_by_region]
 
     ff_winners, ff_rows = _run_round_pairs_for_strategy(
         strategy_label,
@@ -637,6 +877,7 @@ def _simulate_bracket_rows(
         spread_b,
         rng,
         seed_popularity,
+        forced_winner=forced_champion,
     )
     rows.extend(ff_rows)
 
@@ -654,6 +895,7 @@ def _simulate_bracket_rows(
         spread_b,
         rng,
         seed_popularity,
+        forced_winner=forced_champion,
     )
     rows.extend(ncg_rows)
 
@@ -692,6 +934,7 @@ def _run_round_pairs_for_strategy(
     spread_b: float,
     rng: np.random.Generator,
     seed_popularity: PopularityTable | None,
+    forced_winner: str | None = None,
 ) -> tuple[list[str], list[dict[str, str | int | float]]]:
     winners: list[str] = []
     rows: list[dict[str, str | int | float]] = []
@@ -710,6 +953,7 @@ def _run_round_pairs_for_strategy(
             spread_b,
             rng,
             seed_popularity,
+            forced_winner=forced_winner,
         )
         winners.append(winner)
         rows.append(
@@ -743,6 +987,7 @@ def _select_game_winner(
     rng: np.random.Generator,
     seed_popularity: PopularityTable | None,
     r64_odds: R64OddsTable | None = None,
+    forced_winner: str | None = None,
 ) -> tuple[str, float, float]:
     base_p_a = win_probability(
         ratings.get(team_a, 0.0),
@@ -758,6 +1003,10 @@ def _select_game_winner(
         if key in r64_odds:
             fav_name, p_fav = r64_odds[key]
             base_p_a = p_fav if team_a == fav_name else 1.0 - p_fav
+
+    if forced_winner is not None and forced_winner in (team_a, team_b):
+        adj = 1.0 if forced_winner == team_a else 0.0
+        return forced_winner, base_p_a, adj
 
     if strategy is None:
         winner = team_a if rng.random() < base_p_a else team_b
@@ -915,7 +1164,7 @@ def _run_strategy_once(
     r64_odds: R64OddsTable | None = None,
 ) -> list[dict[str, str | int | float]]:
     rows: list[dict[str, str | int | float]] = []
-    regional_champs: list[str] = []
+    champs_by_region: dict[str, str] = {}
 
     for region in regions:
         current_teams: list[str] = []
@@ -950,7 +1199,10 @@ def _run_strategy_once(
             strategy, "E8", region, current_teams, ratings, tempos, sigma70, spread_a, spread_b, rng
         )
         rows.extend(new_rows)
-        regional_champs.extend(current_teams)
+        champs_by_region[region] = current_teams[0]
+
+    f4_region_order = ["East", "South", "Midwest", "West"]
+    regional_champs = [champs_by_region[r] for r in f4_region_order if r in champs_by_region]
 
     ff_winners, ff_rows = _run_round_pairs(
         strategy, "F4", "FinalFour", regional_champs, ratings, tempos, sigma70, spread_a, spread_b, rng

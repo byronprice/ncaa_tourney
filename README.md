@@ -146,6 +146,10 @@ python -m ncaa_tourney.cli optimize-picks \
   --out-summary output/optimized_picks_summary.csv
 ```
 
+#### example of actual run from last year
+ first run check-sources, then build-dataset, then this
+python -m ncaa_tourney.cli optimize-picks --teams data/processed/teams.csv --opponent-teams output/source_link_report_espn.csv --games data/processed/round1_games.csv --r64-odds data/raw/round1_game_odds.csv --pool-size 20,122,122,11 --payouts 100,840,840,250 --n-candidates 5000 --n-outcomes 2500 --round-points 1,2,4,8,16,32 --candidate-mix 0.20,0.30,0.50 --opponent-mix 0.6,0.3,0.1 --opponent-safe-seed-chalk-share 0.4 --opponent-seed-popularity data/raw/espn_pick_popularity.csv --opponent-team-popularity data/raw/espn_team_popularity.csv --seed 31 --out output/optimized_picks_upset.csv --out-summary output/optimized_picks_summary.csv
+
 You can also try direct site pulls:
 
 ```bash
