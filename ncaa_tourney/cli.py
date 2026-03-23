@@ -110,16 +110,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_opt.add_argument("--spread-a", type=float, default=-0.78)
     p_opt.add_argument("--spread-b", type=float, default=12.99)
     p_opt.add_argument("--round-points", default="1,2,4,8,16,32")
-    p_opt.add_argument("--candidate-mix", default="0.34,0.33,0.33")
-    p_opt.add_argument("--opponent-mix", default="0.5,0.35,0.15")
-    p_opt.add_argument("--opponent-safe-seed-chalk-share", type=float, default=0.0)
+    p_opt.add_argument("--candidate-mix", default="0.28,0.27,0.27,0.18")
+    p_opt.add_argument("--opponent-mix", default="0.4,0.0,0.3,0.15,0.15")
     p_opt.add_argument("--opponent-seed-popularity", default="")
     p_opt.add_argument("--opponent-teams", default="")
     p_opt.add_argument("--opponent-team-popularity", default="")
+    p_opt.add_argument("--opponent-power-ratings", default="")
+    p_opt.add_argument("--rating-noise-sigma", type=float, default=1.1)
     p_opt.add_argument("--r64-odds", default="")
     p_opt.add_argument("--payouts", type=str, default="")
     p_opt.add_argument("--out", required=True)
     p_opt.add_argument("--out-summary", required=True)
+
+    p_fit = sub.add_parser("fit-power-model")
+    p_fit.add_argument("--games", required=True)
+    p_fit.add_argument("--yahoo-picks", required=True)
+    p_fit.add_argument("--out", required=True)
+    p_fit.add_argument("--sigma", type=float, default=0.0,
+                       help="Posthoc rating noise std (default 0.0). "
+                            "Set based on cross-system disagreement, e.g. --sigma 1.1.")
 
     return parser
 
@@ -234,7 +243,7 @@ def main() -> None:
         games = pd.read_csv(args.games)
         round_points = _parse_round_points(args.round_points)
         candidate_mix = _parse_strategy_mix(args.candidate_mix)
-        opponent_mix = _parse_strategy_mix(args.opponent_mix)
+        opponent_mix = _parse_opponent_mix(args.opponent_mix)
         opponent_seed_popularity = _load_seed_popularity(args.opponent_seed_popularity)
 
         pool_sizes = _parse_pool_sizes(args.pool_size)
@@ -242,6 +251,7 @@ def main() -> None:
         r64_odds = _load_r64_odds(args.r64_odds)
         opponent_teams = pd.read_csv(args.opponent_teams) if args.opponent_teams else None
         opponent_team_popularity = _load_team_popularity(args.opponent_team_popularity)
+        opponent_power_ratings = _load_power_ratings(args.opponent_power_ratings)
 
         picks, summary, candidates = optimize_pool_bracket(
             teams,
@@ -255,12 +265,13 @@ def main() -> None:
             round_points=round_points,
             candidate_mix=candidate_mix,
             opponent_mix=opponent_mix,
-            opponent_safe_seed_chalk_share=args.opponent_safe_seed_chalk_share,
             opponent_seed_popularity=opponent_seed_popularity,
             r64_odds=r64_odds,
             opponent_teams_df=opponent_teams,
             opponent_team_popularity=opponent_team_popularity,
             pool_payouts=pool_payouts,
+            opponent_power_ratings=opponent_power_ratings,
+            rating_noise_sigma=args.rating_noise_sigma,
         )
 
         from pathlib import Path
@@ -273,6 +284,30 @@ def main() -> None:
         print(f"Wrote optimized picks to {args.out}")
         print(f"Wrote entry summary to {args.out_summary}")
         print(f"Wrote candidate ranking to {candidates_path}")
+        return
+
+    if args.command == "fit-power-model":
+        from ncaa_tourney.power_model import fit_power_ratings, _ALPHA_PREFIX, _GAMMA_KEY, _SIGMA_KEY
+        games_df = pd.read_csv(args.games)
+        yahoo_df = pd.read_csv(args.yahoo_picks)
+        sigma_input = float(getattr(args, "sigma", 0.0))
+        if sigma_input > 0.0:
+            print(f"Fitting power ratings (L-BFGS-B, simulation-based, sigma={sigma_input:.4f})…")
+        else:
+            print("Fitting power ratings (L-BFGS-B, simulation-based)…")
+        params = fit_power_ratings(yahoo_df, games_df, sigma=sigma_input)
+        team_rows = sorted(
+            [(k, v) for k, v in params.items() if not k.startswith("__")],
+            key=lambda kv: -kv[1],
+        )
+        sentinel_rows = [(k, v) for k, v in params.items() if k.startswith("__")]
+        ratings_df = pd.DataFrame(team_rows + sentinel_rows, columns=["Team", "Value"])
+        ensure_parent(args.out)
+        ratings_df.to_csv(args.out, index=False)
+        gamma = params.get(_GAMMA_KEY, 0.0)
+        sigma_out = params.get(_SIGMA_KEY, 0.0)
+        print(f"Fitted {len(team_rows)} team ratings + {len(sentinel_rows)} params "
+              f"(gamma={gamma:.4f}, sigma={sigma_out:.4f}) → {args.out}")
         return
 
     if args.command == "check-sources":
@@ -393,15 +428,36 @@ def _parse_round_points(value: str) -> dict[str, int]:
 
 def _parse_strategy_mix(value: str) -> dict[str, float]:
     tokens = [token.strip() for token in value.split(",") if token.strip()]
-    if len(tokens) != 3:
-        raise ValueError("Strategy mix must contain exactly 3 comma-separated numbers: safe,balanced,upset_heavy")
+    if len(tokens) == 3:
+        safe, balanced, upset_heavy = [float(t) for t in tokens]
+        return {"safe": safe, "balanced": balanced, "upset_heavy": upset_heavy, "safe_plus": 0.0}
+    elif len(tokens) == 4:
+        safe, balanced, upset_heavy, safe_plus = [float(t) for t in tokens]
+        return {"safe": safe, "balanced": balanced, "upset_heavy": upset_heavy, "safe_plus": safe_plus}
+    else:
+        raise ValueError(
+            "Strategy mix must be 3 or 4 comma-separated numbers: safe,balanced,upset_heavy[,safe_plus]"
+        )
 
-    safe, balanced, upset_heavy = [float(token) for token in tokens]
-    return {
-        "safe": safe,
-        "balanced": balanced,
-        "upset_heavy": upset_heavy,
-    }
+
+def _parse_opponent_mix(value: str) -> dict[str, float]:
+    tokens = [token.strip() for token in value.split(",") if token.strip()]
+    if len(tokens) == 4:
+        safe, safe_seeded, balanced, upset_heavy = [float(t) for t in tokens]
+        return {"safe": safe, "safe_seeded": safe_seeded, "balanced": balanced,
+                "upset_heavy": upset_heavy, "safe_plus": 0.0, "chalk_plus": 0.0}
+    elif len(tokens) == 5:
+        safe, safe_seeded, balanced, upset_heavy, safe_plus = [float(t) for t in tokens]
+        return {"safe": safe, "safe_seeded": safe_seeded, "balanced": balanced,
+                "upset_heavy": upset_heavy, "safe_plus": safe_plus, "chalk_plus": 0.0}
+    elif len(tokens) == 6:
+        safe, safe_seeded, balanced, upset_heavy, safe_plus, chalk_plus = [float(t) for t in tokens]
+        return {"safe": safe, "safe_seeded": safe_seeded, "balanced": balanced,
+                "upset_heavy": upset_heavy, "safe_plus": safe_plus, "chalk_plus": chalk_plus}
+    else:
+        raise ValueError(
+            "Opponent mix must be 4-6 comma-separated numbers: safe,safe_seeded,balanced,upset_heavy[,safe_plus[,chalk_plus]]"
+        )
 
 
 def _load_r64_odds(path: str) -> dict[frozenset[str], tuple[str, float]] | None:
@@ -473,6 +529,26 @@ def _load_team_popularity(path: str) -> dict[str, dict[str, float]] | None:
         table.setdefault(round_name, {})[team] = float(prob)
 
     return table
+
+
+def _load_power_ratings(path: str) -> dict[str, float] | None:
+    """Load power_ratings.csv → combined params dict {team: theta, __alpha_*__: alpha}.
+
+    Accepts a 'Value' column (current format) or a legacy 'Theta' column.
+    All rows are loaded, including alpha sentinel rows.
+    """
+    if not path:
+        return None
+    frame = pd.read_csv(path)
+    if "Value" in frame.columns:
+        val_col = "Value"
+    elif "Theta" in frame.columns:
+        val_col = "Theta"
+    else:
+        raise ValueError(
+            f"Power ratings file must have a 'Value' (or legacy 'Theta') column; got {list(frame.columns)}"
+        )
+    return {str(row.Team): float(getattr(row, val_col)) for row in frame.itertuples(index=False)}
 
 
 def _normalize_for_suggestion(name: str) -> str:

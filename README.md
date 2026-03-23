@@ -101,7 +101,29 @@ python -m ncaa_tourney.cli init-bracket-template --out data/raw/bracket_manual.c
 
 Expected format is documented in `docs/bracket_format.md`.
 
-### 4) Build unified dataset and run simulations
+### 4) Scrape public bracket pick distribution and fit power ratings
+
+Yahoo Fantasy bracket pick percentages are used to model the public's joint bracket distribution. Scrape them with:
+
+```bash
+python scripts/scrape_yahoo_picks.py
+# → data/raw/yahoo_pick_distribution.csv  (Team, Round, Probability)
+```
+
+This requires Playwright (`pip install playwright && python -m playwright install chromium`) and a Yahoo login on first run.
+
+Fit a sigmoid power ratings model P(i beats j) = σ(θ_i − θ_j) that matches those marginals:
+
+```bash
+python -m ncaa_tourney.cli fit-power-model \
+  --games data/processed/round1_games.csv \
+  --yahoo-picks data/raw/yahoo_pick_distribution.csv \
+  --out output/power_ratings.csv
+```
+
+This writes `output/power_ratings.csv` (columns: `Team`, `Value`), containing 64 team ratings (θ) and 6 round-scaling parameters (α, stored with sentinel keys `__alpha_R64__` through `__alpha_NCG__`). The fitted model minimizes MSE between bracket-DP marginals and Yahoo pick percentages across all rounds (R32 through Champ). Pass `--opponent-power-ratings output/power_ratings.csv` to `optimize-picks` to use these ratings as the opponent model.
+
+### 5) Build unified dataset and run simulations
 
 ```bash
 python -m ncaa_tourney.cli build-dataset \
@@ -138,17 +160,39 @@ python -m ncaa_tourney.cli optimize-picks \
   --n-outcomes 2000 \
   --round-points 1,2,4,8,16,32 \
   --candidate-mix 0.34,0.33,0.33 \
-  --opponent-mix 0.5,0.35,0.15 \
-  --opponent-safe-seed-chalk-share 0.25 \
-  --opponent-seed-popularity data/raw/espn_pick_popularity.csv \
+  --opponent-mix 0.35,0.25,0.3,0.1 \
+  --opponent-power-ratings output/power_ratings.csv \
   --seed 42 \
   --out output/optimized_picks.csv \
   --out-summary output/optimized_picks_summary.csv
 ```
 
+`--opponent-mix` takes five values: `safe,safe_seeded,balanced,upset_heavy,safe_plus`. The `safe_seeded` slice represents public pickers; when `--opponent-power-ratings` is provided, those opponents are simulated via the fitted power model.
+
+`--candidate-mix` takes four values: `safe,balanced,upset_heavy,safe_plus`
+
+**Known limitation — multiple entries in the same pool:** `--pool-size` treats each value as an independent pool with its own opponent draws and separate payout. If you are submitting multiple brackets to the *same* pool (e.g. `--pool-size 122,122`), the current implementation incorrectly draws independent opponent fields for each entry and double-counts the payout. The correct treatment would share one opponent field across all entries in the same pool (`pool_size - n_entries` opponents), apply a single payout, and set the win condition to `max(your entries) > opp_max`. This requires distinguishing pools from entries in the CLI and simulation — not yet implemented.
+
 #### example of actual run from last year
- first run check-sources, then build-dataset, then this
-python -m ncaa_tourney.cli optimize-picks --teams data/processed/teams.csv --opponent-teams output/source_link_report_espn.csv --games data/processed/round1_games.csv --r64-odds data/raw/round1_game_odds.csv --pool-size 20,122,122,11 --payouts 100,840,840,250 --n-candidates 5000 --n-outcomes 2500 --round-points 1,2,4,8,16,32 --candidate-mix 0.20,0.30,0.50 --opponent-mix 0.6,0.3,0.1 --opponent-safe-seed-chalk-share 0.4 --opponent-seed-popularity data/raw/espn_pick_popularity.csv --opponent-team-popularity data/raw/espn_team_popularity.csv --seed 31 --out output/optimized_picks_upset.csv --out-summary output/optimized_picks_summary.csv
+first run check-sources, then build-dataset, then fit-power-model, then this:
+```bash
+conda run -n ncaab python -m ncaa_tourney.cli optimize-picks \
+  --teams data/processed/teams.csv \
+  --opponent-teams output/source_link_report_espn.csv \
+  --games data/processed/round1_games.csv \
+  --r64-odds data/raw/round1_game_odds.csv \
+  --pool-size 20,122,122,11 \
+  --payouts 100,840,840,250 \
+  --n-candidates 5000 \
+  --n-outcomes 2500 \
+  --round-points 1,2,4,8,16,32 \
+  --candidate-mix 0.20,0.30,0.30,0.2 \
+  --opponent-mix 0.2,0.5,0.1,0.1,0.1 \
+  --opponent-power-ratings output/power_ratings.csv \
+  --seed 31 \
+  --out output/optimized_picks.csv \
+  --out-summary output/optimized_picks_summary.csv
+```
 
 You can also try direct site pulls:
 
@@ -197,9 +241,9 @@ export KENPOM_COOKIE='your_cookie_header_here'
 - `safe`: uses pure model probabilities (no strategy adjustment)
 - `balanced`: pulls favorites partway toward 50/50 to increase variance
 - `upset_heavy`: pulls favorites more strongly toward 50/50, creating the highest variance
-- `optimize-picks` supports `--opponent-safe-seed-chalk-share` so part of the simulated `safe` field can use seed-based chalk behavior.
-- Built-in seed-pair upset priors are applied for `R64`, `R32`, and `S16` in this seed-based mode (with fallback logic for missing pairs).
-- If you provide `--opponent-seed-popularity`, those seed-pair upset rates are taken from your file (instead of built-in priors) for rounds listed in the file.
+- `optimize-picks` uses `--opponent-mix safe,safe_seeded,balanced,upset_heavy` (4 values summing to 1) to control the opponent field composition.
+- `safe_seeded` opponents are public pickers — simulated via the fitted power model when `--opponent-power-ratings` is provided (recommended), or via backward-sampling from `--opponent-team-popularity` (legacy fallback).
+- Built-in seed-pair upset priors are applied for `R64`, `R32`, and `S16` in BPI-based opponent strategies.
 
 ### ESPN pick popularity file format
 
@@ -249,9 +293,8 @@ conda run -n ncaab python -m ncaa_tourney.cli optimize-picks \
   --n-outcomes 5000 \
   --round-points 1,2,4,8,16,32 \
   --candidate-mix 0.34,0.33,0.33 \
-  --opponent-mix 0.5,0.35,0.15 \
-  --opponent-safe-seed-chalk-share 0.5 \
-  --opponent-seed-popularity data/raw/espn_pick_popularity.csv \
+  --opponent-mix 0.25,0.25,0.35,0.15 \
+  --opponent-power-ratings output/power_ratings.csv \
   --seed 42 \
   --spread-a -0.78 \
   --spread-b 12.99 \
