@@ -244,14 +244,16 @@ def main() -> None:
         round_points = _parse_round_points(args.round_points)
         candidate_mix = _parse_strategy_mix(args.candidate_mix)
         opponent_mix = _parse_opponent_mix(args.opponent_mix)
-        opponent_seed_popularity = _load_seed_popularity(args.opponent_seed_popularity)
-
         pool_sizes = _parse_pool_sizes(args.pool_size)
         pool_payouts = _parse_payouts(args.payouts, pool_sizes) if args.payouts else None
         r64_odds = _load_r64_odds(args.r64_odds)
         opponent_teams = pd.read_csv(args.opponent_teams) if args.opponent_teams else None
-        opponent_team_popularity = _load_team_popularity(args.opponent_team_popularity)
         opponent_power_ratings = _load_power_ratings(args.opponent_power_ratings)
+
+        if opponent_mix.get("safe_seeded", 0.0) > 0 and not opponent_power_ratings:
+            raise SystemExit(
+                "error: --opponent-power-ratings is required when safe_seeded > 0 in --opponent-mix"
+            )
 
         picks, summary, candidates = optimize_pool_bracket(
             teams,
@@ -265,10 +267,8 @@ def main() -> None:
             round_points=round_points,
             candidate_mix=candidate_mix,
             opponent_mix=opponent_mix,
-            opponent_seed_popularity=opponent_seed_popularity,
             r64_odds=r64_odds,
             opponent_teams_df=opponent_teams,
-            opponent_team_popularity=opponent_team_popularity,
             pool_payouts=pool_payouts,
             opponent_power_ratings=opponent_power_ratings,
             rating_noise_sigma=args.rating_noise_sigma,

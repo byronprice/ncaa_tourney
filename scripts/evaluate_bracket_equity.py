@@ -34,7 +34,6 @@ from ncaa_tourney.simulation import (
     _normalize_strategy_mix,
     SPREAD_TO_Z_A,
     SPREAD_TO_Z_B,
-    SIGMA_70,
 )
 from ncaa_tourney.power_model import simulate_forward_bracket
 
@@ -278,14 +277,14 @@ def main() -> None:
         elif opp_strategy == "safe_plus":
             _, opp_picks, _ = _safe_plus_bracket_rows(
                 regions, region_games, ratings, tempos, seeds,
-                SIGMA_70, SPREAD_TO_Z_A, SPREAD_TO_Z_B, rng, None,
+                SPREAD_TO_Z_A, SPREAD_TO_Z_B, rng, None,
             )
         else:
             _, opp_picks, _ = _simulate_bracket_rows(
                 regions, region_games, ratings, tempos, seeds,
-                SIGMA_70, SPREAD_TO_Z_A, SPREAD_TO_Z_B, rng,
+                SPREAD_TO_Z_A, SPREAD_TO_Z_B, rng,
                 strategy=opp_strategy, strategy_label=opp_strategy,
-                seed_popularity=None, r64_odds=None,
+                r64_odds=None,
             )
         return _score_picks(opp_picks, truth_picks, weight_vector)
 
@@ -296,9 +295,9 @@ def main() -> None:
         # Simulate true tournament outcome
         _, truth_picks, _ = _simulate_bracket_rows(
             regions, region_games, ratings, tempos, seeds,
-            SIGMA_70, SPREAD_TO_Z_A, SPREAD_TO_Z_B, rng,
+            SPREAD_TO_Z_A, SPREAD_TO_Z_B, rng,
             strategy=None, strategy_label="truth",
-            seed_popularity=None, r64_odds=r64_odds,
+            r64_odds=r64_odds,
         )
 
         # Score every bracket against this outcome

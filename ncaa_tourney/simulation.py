@@ -9,7 +9,6 @@ import pandas as pd
 
 
 ROUND_ORDER = ["R64", "R32", "S16", "E8", "F4", "NCG", "Champ"]
-_ROUND_RANK: dict[str, int] = {r: i for i, r in enumerate(ROUND_ORDER)}
 
 # Maps frozenset({team_a, team_b}) -> (favorite_name, p_favorite)
 R64OddsTable = dict[frozenset[str], tuple[str, float]]
@@ -18,7 +17,6 @@ R64OddsTable = dict[frozenset[str], tuple[str, float]]
 # SPREAD_TO_Z_B = 12.99
 SPREAD_TO_Z_A = 0.0
 SPREAD_TO_Z_B = 12.1
-SIGMA_70 = 12.1
 NATIONAL_AVG_TEMPO = 68.0
 
 STRATEGY_RANDOMNESS = {
@@ -30,6 +28,17 @@ STRATEGY_RANDOMNESS = {
 # All candidate strategies, including safe_plus which is handled separately from STRATEGY_RANDOMNESS.
 ALL_STRATEGIES = list(STRATEGY_RANDOMNESS.keys()) + ["safe_plus"]
 
+# opponent strategies
+#  safe - coin flips based on espn bpi power ratings
+#  safe_seeded - based on power_model.py (uses public game outcome probabilities)
+#  balanced - like "safe" above but with more randomness in earlier rounds (higher upset probability)
+#  upset_heavy - like "balanced" but with even more randomness throughout
+#  safe_plus - like "safe" but with a few additional upsets, randomly chosen
+#  chalk_plus - mix between deterministic chalk and safe, 
+#                determ_thresh sets random probability that a given
+#                game will be picked deterministically or with "safe" randomness
+
+
 DEFAULT_ROUND_POINTS = {
     "R64": 1,
     "R32": 2,
@@ -39,92 +48,8 @@ DEFAULT_ROUND_POINTS = {
     "NCG": 32,
 }
 
-PopularityTable = dict[str, dict[tuple[int, int], float]]
-
-# Maps round -> {team_name -> public_pick_probability}
-# Used for F4/NCG/Champ where seed-based lookup no longer identifies teams uniquely.
-# F4 game: use NCG probabilities (% of public picking team to reach the title game)
-# NCG game: use Champ probabilities (% of public picking team to win it all)
-TeamPopularityTable = dict[str, dict[str, float]]
-
-SEED_CHALK_UNDERDOG_PROBS_BY_ROUND = {
-    "R64": {
-        (1, 16): 0.01,
-        (2, 15): 0.08,
-        (3, 14): 0.15,
-        (4, 13): 0.2,
-        (5, 12): 0.35,
-        (6, 11): 0.3,
-        (7, 10): 0.4,
-        (8, 9): 0.48,
-    },
-    "R32": {
-        (1, 8): 0.2,
-        (1, 9): 0.22,
-        (1, 16): 0.06,
-        (2, 7): 0.28,
-        (2, 10): 0.33,
-        (2, 15): 0.14,
-        (3, 6): 0.34,
-        (3, 11): 0.39,
-        (3, 14): 0.22,
-        (4, 5): 0.44,
-        (4, 12): 0.47,
-        (4, 13): 0.3,
-        (5, 12): 0.49,
-        (5, 13): 0.5,
-        (6, 11): 0.46,
-        (6, 14): 0.53,
-        (7, 10): 0.47,
-        (7, 15): 0.56,
-        (8, 9): 0.5,
-        (8, 16): 0.58,
-    },
-    "S16": {
-        (1, 4): 0.31,
-        (1, 5): 0.34,
-        (1, 8): 0.2,
-        (1, 9): 0.23,
-        (1, 12): 0.38,
-        (1, 13): 0.42,
-        (1, 16): 0.08,
-        (2, 3): 0.43,
-        (2, 6): 0.31,
-        (2, 7): 0.35,
-        (2, 10): 0.39,
-        (2, 11): 0.42,
-        (2, 14): 0.5,
-        (2, 15): 0.2,
-        (3, 6): 0.39,
-        (3, 7): 0.41,
-        (3, 10): 0.45,
-        (3, 11): 0.47,
-        (3, 14): 0.56,
-        (4, 5): 0.48,
-        (4, 8): 0.39,
-        (4, 9): 0.42,
-        (4, 12): 0.5,
-        (4, 13): 0.54,
-        (5, 8): 0.44,
-        (5, 9): 0.46,
-        (5, 12): 0.53,
-        (5, 13): 0.56,
-        (6, 7): 0.49,
-        (6, 10): 0.53,
-        (6, 11): 0.55,
-        (6, 14): 0.62,
-        (7, 10): 0.54,
-        (7, 11): 0.57,
-        (7, 15): 0.66,
-        (8, 9): 0.51,
-        (8, 12): 0.58,
-        (8, 13): 0.61,
-        (8, 16): 0.7,
-    },
-}
-
 # to run optimize-picks
-#  python -m ncaa_tourney.cli optimize-picks --teams data/processed/teams.csv --opponent-teams output/source_link_report_espn.csv --games data/processed/round1_games.csv --r64-odds data/raw/round1_game_odds.csv --pool-size 30,30 --n-candidates 1000 --n-outcomes 5000 --round-points 1,2,4,8,16,32 --candidate-mix 0.20,0.30,0.50 --opponent-mix 0.5,0.4,0.1 --opponent-safe-seed-chalk-share 0.25 --opponent-seed-popularity data/raw/espn_pick_popularity.csv --opponent-team-popularity data/raw/espn_team_popularity.csv --seed 53 --out output/optimized_picks.csv --out-summary output/optimized_picks_summary.csv
+#  python -m ncaa_tourney.cli optimize-picks --teams data/processed/teams.csv --opponent-teams output/source_link_report_espn.csv --games data/processed/round1_games.csv --r64-odds data/raw/round1_game_odds.csv --pool-size 30,30 --n-candidates 1000 --n-outcomes 5000 --round-points 1,2,4,8,16,32 --candidate-mix 0.20,0.30,0.50 --opponent-mix 0.5,0.4,0.1 --opponent-safe-seed-chalk-share 0.25 --opponent-seed-popularity data/raw/espn_pick_popularity.csv --seed 53 --out output/optimized_picks.csv --out-summary output/optimized_picks_summary.csv
 
 
 @dataclass
@@ -143,7 +68,6 @@ def win_probability(
     rating_b: float,
     tempo_a: float = 70.0,
     tempo_b: float = 70.0,
-    sigma70: float = SIGMA_70,
     spread_a: float = SPREAD_TO_Z_A,
     spread_b: float = SPREAD_TO_Z_B,
     national_avg_tempo: float = NATIONAL_AVG_TEMPO,
@@ -216,7 +140,6 @@ def simulate_tournament(
     games_df: pd.DataFrame,
     n_sims: int,
     seed: int = 42,
-    sigma70: float = SIGMA_70,
     spread_a: float = SPREAD_TO_Z_A,
     spread_b: float = SPREAD_TO_Z_B,
     r64_odds: R64OddsTable | None = None,
@@ -243,7 +166,7 @@ def simulate_tournament(
             first_round = region_games[region]
             r64_winners = []
             for game in first_round:
-                winner = _simulate_game(game[0], game[1], ratings, tempos, sigma70, spread_a, spread_b, rng, r64_odds)
+                winner = _simulate_game(game[0], game[1], ratings, tempos, spread_a, spread_b, rng, r64_odds)
                 r64_winners.append(winner)
                 full_path.append(f"{region}:R64:{winner}")
                 advancement[winner]["R32"] += 1
@@ -252,7 +175,6 @@ def simulate_tournament(
                 r64_winners,
                 ratings,
                 tempos,
-                sigma70,
                 spread_a,
                 spread_b,
                 rng,
@@ -266,7 +188,6 @@ def simulate_tournament(
                 r32_winners,
                 ratings,
                 tempos,
-                sigma70,
                 spread_a,
                 spread_b,
                 rng,
@@ -280,7 +201,6 @@ def simulate_tournament(
                 s16_winners,
                 ratings,
                 tempos,
-                sigma70,
                 spread_a,
                 spread_b,
                 rng,
@@ -298,7 +218,6 @@ def simulate_tournament(
             regional_champs,
             ratings,
             tempos,
-            sigma70,
             spread_a,
             spread_b,
             rng,
@@ -312,7 +231,6 @@ def simulate_tournament(
             f4_winners,
             ratings,
             tempos,
-            sigma70,
             spread_a,
             spread_b,
             rng,
@@ -336,7 +254,6 @@ def generate_strategy_brackets(
     teams_df: pd.DataFrame,
     games_df: pd.DataFrame,
     seed: int = 42,
-    sigma70: float = 10.5,
     spread_a: float = SPREAD_TO_Z_A,
     spread_b: float = SPREAD_TO_Z_B,
     r64_odds: R64OddsTable | None = None,
@@ -347,17 +264,17 @@ def generate_strategy_brackets(
     regions = sorted(region_games.keys())
 
     rows: list[dict[str, str | int | float]] = []
-    for offset, strategy in enumerate(["safe", "balanced", "upset_heavy", "safe_plus"]):
+    for offset, strategy in enumerate(ALL_STRATEGIES):
         rng = np.random.default_rng(seed + offset)
         if strategy == "safe_plus":
             # Seeds not needed for the "safe" sub-strategy; pass empty dicts.
             sp_rows, _, _ = _safe_plus_bracket_rows(
-                regions, region_games, ratings, tempos, {}, sigma70, spread_a, spread_b, rng, None, r64_odds,
+                regions, region_games, ratings, tempos, {}, spread_a, spread_b, rng, None, r64_odds,
             )
             rows.extend(sp_rows)
         else:
             rows.extend(
-                _run_strategy_once(strategy, regions, region_games, ratings, tempos, sigma70, spread_a, spread_b, rng, r64_odds)
+                _run_strategy_once(strategy, regions, region_games, ratings, tempos, spread_a, spread_b, rng, r64_odds)
             )
 
     return pd.DataFrame(rows)
@@ -428,16 +345,13 @@ def optimize_pool_bracket(
     n_candidates: int = 300,
     n_outcomes: int = 2000,
     seed: int = 42,
-    sigma70: float = 10.5,
     spread_a: float = SPREAD_TO_Z_A,
     spread_b: float = SPREAD_TO_Z_B,
     round_points: dict[str, int] | None = None,
     candidate_mix: dict[str, float] | None = None,
     opponent_mix: dict[str, float] | None = None,
-    opponent_seed_popularity: PopularityTable | None = None,
     r64_odds: R64OddsTable | None = None,
     opponent_teams_df: pd.DataFrame | None = None,
-    opponent_team_popularity: TeamPopularityTable | None = None,
     pool_payouts: list[float] | None = None,
     opponent_power_ratings: dict[str, float] | None = None,
     rating_noise_sigma: float = 1.1,
@@ -481,7 +395,7 @@ def optimize_pool_bracket(
         if strategy == "safe_plus":
             rows, picks, rounds = _safe_plus_bracket_rows(
                 regions, region_games, ratings, tempos, seeds,
-                sigma70, spread_a, spread_b, rng, opponent_seed_popularity, r64_odds,
+                spread_a, spread_b, rng, r64_odds,
             )
         else:
             rows, picks, rounds = _simulate_bracket_rows(
@@ -490,13 +404,11 @@ def optimize_pool_bracket(
                 ratings,
                 tempos,
                 seeds,
-                sigma70,
                 spread_a,
                 spread_b,
                 rng,
                 strategy,
                 strategy,
-                opponent_seed_popularity,
                 r64_odds,
             )
         champ_pick = next((r["Pick"] for r in rows if r.get("Round") == "Champ"), None)
@@ -551,20 +463,21 @@ def optimize_pool_bracket(
     def _simulate_opponent(truth_picks: list[str]) -> int:
         """Simulate one opponent and return score."""
         opp_strategy = str(rng.choice(opponent_strategy_names, p=opponent_weights))
-        if opp_strategy == "safe_seeded" and opponent_power_ratings is not None:
+        if opp_strategy == "safe_seeded":
+            if opponent_power_ratings is None:
+                raise ValueError("safe_seeded opponent strategy requires opponent_power_ratings (--opponent-power-ratings)")
             from ncaa_tourney.power_model import simulate_forward_bracket
             opp_picks = simulate_forward_bracket(opponent_power_ratings, region_games, rng)
         elif opp_strategy == "safe_plus":
             _, opp_picks, _ = _safe_plus_bracket_rows(
                 regions, region_games, opponent_ratings, opponent_tempos, seeds,
-                sigma70, spread_a, spread_b, rng, opponent_seed_popularity,
+                spread_a, spread_b, rng,
             )
         elif opp_strategy == "chalk_plus":
             _, opp_picks, _ = _simulate_bracket_rows(
                 regions, region_games, opponent_ratings, opponent_tempos, seeds,
-                sigma70, spread_a, spread_b, rng,
+                spread_a, spread_b, rng,
                 strategy=None, strategy_label="chalk_plus",
-                seed_popularity=opponent_seed_popularity,
                 determ_thresh=0.6,
             )
         else:
@@ -574,15 +487,12 @@ def optimize_pool_bracket(
                 opponent_ratings,
                 opponent_tempos,
                 seeds,
-                sigma70,
                 spread_a,
                 spread_b,
                 rng,
                 strategy=opp_strategy,
                 strategy_label=opp_strategy,
-                seed_popularity=opponent_seed_popularity,
                 r64_odds=None,
-                team_popularity=opponent_team_popularity,
             )
         return _score_picks(opp_picks, truth_picks, weight_vector)
 
@@ -597,13 +507,11 @@ def optimize_pool_bracket(
             noisy_ratings,
             tempos,
             seeds,
-            sigma70,
             spread_a,
             spread_b,
             rng,
             strategy=None,
             strategy_label="truth",
-            seed_popularity=None,
             r64_odds=r64_odds,
         )
 
@@ -692,208 +600,6 @@ def optimize_pool_bracket(
     return pd.DataFrame(all_rows), pd.DataFrame(entry_summary_rows), pd.DataFrame(candidate_summary_rows)
 
 
-def _sample_backward_bracket(
-    team_popularity: TeamPopularityTable,
-    region_games: dict[str, list[tuple[str, str]]],
-    ratings: dict[str, float],
-    rng: np.random.Generator,
-) -> dict[str, str]:
-    """Backward-sample a complete bracket from ESPN public pick popularity.
-
-    Returns forced_max_win: {team_name: max_round_to_win} where
-    max_round_to_win is the latest round that team must WIN.
-    Teams absent from the dict lose in R64.
-
-    At each step, weights = round% - next_round%, and
-    total_mass = sum(next_round% for the winning sub-bracket of that game).
-    This gives the exact conditional probability for each draw.
-
-    Bracket structure per region (8 R64 games, 0-indexed):
-      Quads:  0=(g0,g1)  1=(g2,g3)  2=(g4,g5)  3=(g6,g7)
-      Halves: top=(g0-g3)  bottom=(g4-g7)
-      Partner game:  g ^ 1  (0↔1, 2↔3, 4↔5, 6↔7)
-      Partner quad:  q ^ 1  (0↔1, 2↔3)
-    """
-    from ncaa_tourney.rankings import _canonical_team_key, _resolve_alias
-
-    region_to_teams: dict[str, set[str]] = {}
-    for region, games in region_games.items():
-        ts: set[str] = set()
-        for a, b in games:
-            ts.add(a)
-            ts.add(b)
-        region_to_teams[region] = ts
-
-    all_game_teams = {t for ts in region_to_teams.values() for t in ts}
-    canon_to_game: dict[str, str] = {}
-    for t in all_game_teams:
-        key = _resolve_alias(_canonical_team_key(t))
-        canon_to_game[key] = t
-
-    def espn_mass(round_name: str, eligible: set[str], subtract_round: str | None = None) -> float:
-        pop = team_popularity.get(round_name, {})
-        sub_pop = team_popularity.get(subtract_round, {}) if subtract_round else {}
-        sub_by_key = {_resolve_alias(_canonical_team_key(n)): float(p) for n, p in sub_pop.items()}
-        total = 0.0
-        for name, prob in pop.items():
-            key = _resolve_alias(_canonical_team_key(name))
-            if canon_to_game.get(key) in eligible:
-                total += max(0.0, float(prob) - sub_by_key.get(key, 0.0))
-        return total
-
-    def get_weights(
-        round_name: str,
-        eligible: set[str],
-        subtract_round: str | None = None,
-        total_mass: float | None = None,
-    ) -> dict[str, float]:
-        pop = team_popularity.get(round_name, {})
-        sub_pop = team_popularity.get(subtract_round, {}) if subtract_round else {}
-        sub_by_key = {_resolve_alias(_canonical_team_key(n)): float(p) for n, p in sub_pop.items()}
-        weights: dict[str, float] = {}
-        listed_in: set[str] = set()
-        listed_sum = 0.0
-        for pop_name, prob in pop.items():
-            key = _resolve_alias(_canonical_team_key(pop_name))
-            game_name = canon_to_game.get(key)
-            if game_name and game_name in eligible:
-                w = max(0.0, float(prob) - sub_by_key.get(key, 0.0))
-                weights[game_name] = w
-                listed_sum += w
-                listed_in.add(game_name)
-        unlisted = eligible - listed_in
-        if unlisted:
-            residual_base = total_mass if total_mass is not None else 1.0
-            residual = max(0.0, residual_base - listed_sum)
-            bpi_sum = sum(max(ratings.get(t, 0.0), 0.0) for t in unlisted)
-            if residual > 0.0 and bpi_sum > 0.0:
-                for t in unlisted:
-                    weights[t] = (max(ratings.get(t, 0.0), 0.0) / bpi_sum) * residual
-            elif bpi_sum > 0.0:
-                for t in unlisted:
-                    weights[t] = (max(ratings.get(t, 0.0), 0.0) / bpi_sum) * 1e-4
-            else:
-                for t in unlisted:
-                    weights[t] = 1e-4 / len(unlisted)
-        return weights
-
-    def draw(weights: dict[str, float]) -> str:
-        teams_list = list(weights.keys())
-        if not teams_list:
-            return ""
-        w = np.array([weights[t] for t in teams_list], dtype=np.float64)
-        total = w.sum()
-        if total <= 0.0:
-            return str(rng.choice(teams_list))
-        w /= total
-        return teams_list[int(rng.choice(len(teams_list), p=w))]
-
-    def game_of(team: str, games: list[tuple[str, str]]) -> int:
-        for i, (a, b) in enumerate(games):
-            if team in (a, b):
-                return i
-        return -1
-
-    def teams_in_slice(games: list[tuple[str, str]], start: int, end: int) -> set[str]:
-        return {t for g in games[start:end] for t in g}
-
-    half_a = ["East", "South"]
-    half_b = ["Midwest", "West"]
-    forced_max_win: dict[str, str] = {}
-
-    # Step 1: Champion
-    champion = draw(get_weights("Champ", all_game_teams))
-    if not champion:
-        return {}
-    forced_max_win[champion] = "NCG"
-    champ_region = next((r for r, ts in region_to_teams.items() if champion in ts), None)
-    if not champ_region:
-        return {}
-    champ_half = half_a if champ_region in half_a else half_b
-    opp_half = half_b if champ_half == half_a else half_a
-
-    # Step 2: NCG loser — from opposite bracket half.
-    # total_mass = sum(Champ% for champ_half) = P(champion from champ_half)
-    opp_half_teams = {t for r in opp_half for t in region_to_teams.get(r, set())}
-    champ_half_teams = {t for r in champ_half for t in region_to_teams.get(r, set())}
-    ncg_total_mass = espn_mass("Champ", champ_half_teams)
-    ncg_opponent = draw(get_weights("NCG", opp_half_teams, subtract_round="Champ", total_mass=ncg_total_mass))
-    if not ncg_opponent:
-        return {}
-    forced_max_win[ncg_opponent] = "F4"
-    ncg_region = next((r for r, ts in region_to_teams.items() if ncg_opponent in ts), None)
-
-    # Step 3: F4 losers — one from each remaining region.
-    # total_mass = sum(NCG% for the winning region) = P(that region wins their F4 game)
-    champ_other = next((r for r in champ_half if r != champ_region), None)
-    opp_other = next((r for r in opp_half if r != ncg_region), None) if ncg_region else None
-    regional_champs: dict[str, str] = {champ_region: champion}
-    if ncg_region:
-        regional_champs[ncg_region] = ncg_opponent
-    for region, winner_region in [(champ_other, champ_region), (opp_other, ncg_region)]:
-        if region and winner_region:
-            region_teams = region_to_teams.get(region, set())
-            winner_teams = region_to_teams.get(winner_region, set())
-            f4_total_mass = espn_mass("NCG", winner_teams)
-            f4_loser = draw(get_weights("F4", region_teams, subtract_round="NCG", total_mass=f4_total_mass))
-            if f4_loser:
-                forced_max_win[f4_loser] = "E8"
-                regional_champs[region] = f4_loser
-
-    # Steps 4–6: per-region backward sampling
-    for region, reg_champ in regional_champs.items():
-        games = region_games.get(region, [])
-        if len(games) < 8:
-            continue
-        champ_game = game_of(reg_champ, games)
-        if champ_game < 0:
-            continue
-        champ_half_idx = champ_game // 4   # 0=top(g0-g3), 1=bottom(g4-g7)
-        champ_quad = champ_game // 2       # 0,1,2,3
-        opp_half_idx = 1 - champ_half_idx
-
-        # Step 4: E8 loser — from the opposite region-half.
-        # total_mass = sum(F4% for champ's region-half)
-        champ_half_teams_r = teams_in_slice(games, champ_half_idx * 4, champ_half_idx * 4 + 4)
-        e8_eligible = teams_in_slice(games, opp_half_idx * 4, opp_half_idx * 4 + 4)
-        e8_total_mass = espn_mass("F4", champ_half_teams_r)
-        e8_loser = draw(get_weights("E8", e8_eligible, subtract_round="F4", total_mass=e8_total_mass))
-        if not e8_loser:
-            continue
-        forced_max_win[e8_loser] = "S16"
-        e8_loser_quad = game_of(e8_loser, games) // 2
-
-        # Step 5: S16 losers — one per E8 participant, from their partner quad.
-        # total_mass = sum(E8% for that E8 participant's quad)
-        for e8_team, e8_quad in [(reg_champ, champ_quad), (e8_loser, e8_loser_quad)]:
-            partner_quad = e8_quad ^ 1  # 0↔1, 2↔3
-            s16_eligible = teams_in_slice(games, partner_quad * 2, partner_quad * 2 + 2)
-            s16_total_mass = espn_mass("E8", teams_in_slice(games, e8_quad * 2, e8_quad * 2 + 2))
-            s16_loser = draw(get_weights("S16", s16_eligible, subtract_round="E8", total_mass=s16_total_mass))
-            if s16_loser:
-                forced_max_win[s16_loser] = "R32"
-
-        # Step 6: R32 losers — one per S16 participant, from their partner R64 game.
-        # total_mass = sum(S16% for that S16 participant's R64 game pair)
-        region_teams_set = region_to_teams.get(region, set())
-        s16_participants = [
-            t for t, max_r in forced_max_win.items()
-            if t in region_teams_set and _ROUND_RANK.get(max_r, -1) >= _ROUND_RANK["S16"]
-        ]
-        for s16_team in s16_participants:
-            t_game = game_of(s16_team, games)
-            if t_game < 0:
-                continue
-            partner_game = t_game ^ 1  # 0↔1, 2↔3, 4↔5, 6↔7
-            r32_eligible = set(games[partner_game])
-            r32_total_mass = espn_mass("S16", set(games[t_game]))
-            r32_loser = draw(get_weights("R32", r32_eligible, subtract_round="S16", total_mass=r32_total_mass))
-            if r32_loser:
-                forced_max_win[r32_loser] = "R64"
-
-    return forced_max_win
-
-
 def _sort_region_games(games_df: pd.DataFrame) -> dict[str, list[tuple[str, str]]]:
     grouped: dict[str, list[tuple[str, str]]] = {}
     for region, group in games_df.groupby("Region"):
@@ -949,11 +655,9 @@ def _safe_plus_bracket_rows(
     ratings: dict[str, float],
     tempos: dict[str, float],
     seeds: dict[str, int],
-    sigma70: float,
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
-    seed_popularity: PopularityTable | None,
     r64_odds: R64OddsTable | None = None,
 ) -> tuple[list[dict[str, str | int | float]], list[str], list[str]]:
     """safe_plus strategy:
@@ -966,8 +670,8 @@ def _safe_plus_bracket_rows(
     # Step 1: run the full safe simulation.
     rows, _, _ = _simulate_bracket_rows(
         regions, region_games, ratings, tempos, seeds,
-        sigma70, spread_a, spread_b, rng, "safe", "safe_plus",
-        seed_popularity, r64_odds,
+        spread_a, spread_b, rng, "safe", "safe_plus",
+        r64_odds,
     )
 
     # Step 2: compute R64 win probabilities for variance weights.
@@ -981,7 +685,7 @@ def _safe_plus_bracket_rows(
         p = win_probability(
             ratings.get(ta, 0.0), ratings.get(tb, 0.0),
             tempos.get(ta, 70.0), tempos.get(tb, 70.0),
-            sigma70=sigma70, spread_a=spread_a, spread_b=spread_b,
+            spread_a=spread_a, spread_b=spread_b,
         )
         if r64_odds is not None:
             key = frozenset({ta, tb})
@@ -1030,38 +734,19 @@ def _simulate_bracket_rows(
     ratings: dict[str, float],
     tempos: dict[str, float],
     seeds: dict[str, int],
-    sigma70: float,
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
     strategy: str | None,
     strategy_label: str,
-    seed_popularity: PopularityTable | None,
     r64_odds: R64OddsTable | None = None,
-    team_popularity: TeamPopularityTable | None = None,
     determ_thresh: float | None = None,
 ) -> tuple[list[dict[str, str | int | float]], list[str], list[str]]:
     rows: list[dict[str, str | int | float]] = []
     champs_by_region: dict[str, str] = {}
 
-    # Backward-sample a complete bracket when team popularity data is available.
-    # forced_max_win[team] = latest round that team must WIN (before losing).
-    # Teams absent from the dict lose in R64.
-    forced_max_win: dict[str, str] = {}
-    if strategy == "safe_seeded" and team_popularity is not None:
-        forced_max_win = _sample_backward_bracket(team_popularity, region_games, ratings, rng)
-
-    def forced_for_round(round_name: str) -> list[str] | None:
-        """Teams that must win in this round (their max_win rank >= this round's rank)."""
-        if not forced_max_win:
-            return None
-        r = _ROUND_RANK.get(round_name, -1)
-        winners = [t for t, mx in forced_max_win.items() if _ROUND_RANK.get(mx, -1) >= r]
-        return winners or None
-
     for region in regions:
         current_teams: list[str] = []
-        r64_forced = forced_for_round("R64")
         for game_index, (team_a, team_b) in enumerate(region_games[region], start=1):
             winner, base_p_a, adjusted_p_a = _select_game_winner(
                 team_a,
@@ -1071,13 +756,11 @@ def _simulate_bracket_rows(
                 seeds,
                 strategy,
                 "R64",
-                sigma70,
                 spread_a,
                 spread_b,
                 rng,
-                seed_popularity,
                 r64_odds,
-                forced_winner=r64_forced,
+                forced_winner=None,
                 determ_thresh=determ_thresh,
             )
             rows.append(
@@ -1105,12 +788,10 @@ def _simulate_bracket_rows(
                 ratings,
                 tempos,
                 seeds,
-                sigma70,
                 spread_a,
                 spread_b,
                 rng,
-                seed_popularity,
-                forced_winner=forced_for_round(round_name),
+                forced_winner=None,
                 determ_thresh=determ_thresh,
             )
             rows.extend(new_rows)
@@ -1128,12 +809,10 @@ def _simulate_bracket_rows(
         ratings,
         tempos,
         seeds,
-        sigma70,
         spread_a,
         spread_b,
         rng,
-        seed_popularity,
-        forced_winner=forced_for_round("F4"),
+        forced_winner=None,
         determ_thresh=determ_thresh,
     )
     rows.extend(ff_rows)
@@ -1147,12 +826,10 @@ def _simulate_bracket_rows(
         ratings,
         tempos,
         seeds,
-        sigma70,
         spread_a,
         spread_b,
         rng,
-        seed_popularity,
-        forced_winner=forced_for_round("NCG"),
+        forced_winner=None,
         determ_thresh=determ_thresh,
     )
     rows.extend(ncg_rows)
@@ -1187,11 +864,9 @@ def _run_round_pairs_for_strategy(
     ratings: dict[str, float],
     tempos: dict[str, float],
     seeds: dict[str, int],
-    sigma70: float,
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
-    seed_popularity: PopularityTable | None,
     forced_winner: str | list[str] | None = None,
     determ_thresh: float | None = None,
 ) -> tuple[list[str], list[dict[str, str | int | float]]]:
@@ -1207,11 +882,9 @@ def _run_round_pairs_for_strategy(
             seeds,
             strategy,
             round_name,
-            sigma70,
             spread_a,
             spread_b,
             rng,
-            seed_popularity,
             forced_winner=forced_winner,
             determ_thresh=determ_thresh,
         )
@@ -1241,11 +914,9 @@ def _select_game_winner(
     seeds: dict[str, int],
     strategy: str | None,
     round_name: str,
-    sigma70: float,
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
-    seed_popularity: PopularityTable | None,
     r64_odds: R64OddsTable | None = None,
     forced_winner: str | list[str] | None = None,
     determ_thresh: float | None = None,
@@ -1255,7 +926,6 @@ def _select_game_winner(
         ratings.get(team_b, 0.0),
         tempos.get(team_a, 70.0),
         tempos.get(team_b, 70.0),
-        sigma70=sigma70,
         spread_a=spread_a,
         spread_b=spread_b,
     )
@@ -1273,7 +943,7 @@ def _select_game_winner(
 
     if determ_thresh is not None and determ_thresh > 0.0:
         favorite = team_a if base_p_a >= 0.5 else team_b
-        if rng.random() < determ_thresh:
+        if rng.random() < determ_thresh and round_name != "F4" and round_name != "NCG": # avoid determinism in the most critical games
             return favorite, base_p_a, base_p_a
         winner = team_a if rng.random() < base_p_a else team_b
         return winner, base_p_a, base_p_a
@@ -1281,11 +951,6 @@ def _select_game_winner(
     if strategy is None:
         winner = team_a if rng.random() < base_p_a else team_b
         return winner, base_p_a, base_p_a
-
-    if strategy == "safe_seeded":
-        adjusted_p_a = _seed_chalk_probability(team_a, team_b, round_name, base_p_a, seeds, seed_popularity)
-        winner = team_a if rng.random() < adjusted_p_a else team_b
-        return winner, base_p_a, adjusted_p_a
 
     randomness = STRATEGY_RANDOMNESS[strategy].get(round_name, 0.0)
     p_favorite = max(base_p_a, 1.0 - base_p_a)
@@ -1296,48 +961,12 @@ def _select_game_winner(
     return winner, base_p_a, adjusted_p_a
 
 
-def _seed_chalk_probability(
-    team_a: str,
-    team_b: str,
-    round_name: str,
-    base_p_a: float,
-    seeds: dict[str, int],
-    seed_popularity: PopularityTable | None,
-) -> float:
-    seed_a = seeds.get(team_a)
-    seed_b = seeds.get(team_b)
-    if seed_a is None or seed_b is None:
-        return base_p_a
-
-    favorite_is_a = seed_a < seed_b
-    seed_favorite = min(seed_a, seed_b)
-    seed_underdog = max(seed_a, seed_b)
-
-    round_probs = None
-    if seed_popularity and round_name in seed_popularity:
-        round_probs = seed_popularity[round_name]
-    elif round_name in SEED_CHALK_UNDERDOG_PROBS_BY_ROUND:
-        round_probs = SEED_CHALK_UNDERDOG_PROBS_BY_ROUND[round_name]
-
-    if round_probs is not None:
-        p_underdog = round_probs.get((seed_favorite, seed_underdog))
-        if p_underdog is None:
-            seed_gap = max(seed_underdog - seed_favorite, 0)
-            p_underdog = float(np.clip(0.4 - (0.025 * seed_gap), 0.12, 0.5))
-    else:
-        seed_gap = max(seed_underdog - seed_favorite, 0)
-        p_underdog = float(np.clip(0.45 - (0.03 * seed_gap), 0.12, 0.45))
-
-    p_favorite = 1.0 - p_underdog
-    p_a = p_favorite if favorite_is_a else p_underdog
-    return float(np.clip(p_a, 0.01, 0.99))
 
 
 def _play_round(
     teams: list[str],
     ratings: dict[str, float],
     tempos: dict[str, float],
-    sigma70: float,
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
@@ -1349,7 +978,7 @@ def _play_round(
 ) -> list[str]:
     winners = []
     for i in range(0, len(teams), 2):
-        winner = _simulate_game(teams[i], teams[i + 1], ratings, tempos, sigma70, spread_a, spread_b, rng)
+        winner = _simulate_game(teams[i], teams[i + 1], ratings, tempos, spread_a, spread_b, rng)
         winners.append(winner)
         full_path.append(f"{region}:{current_round}:{winner}")
         advancement[winner][advances_to] += 1
@@ -1361,7 +990,6 @@ def _simulate_game(
     team_b: str,
     ratings: dict[str, float],
     tempos: dict[str, float],
-    sigma70: float,
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
@@ -1372,7 +1000,6 @@ def _simulate_game(
         ratings.get(team_b, 0.0),
         tempos.get(team_a, 70.0),
         tempos.get(team_b, 70.0),
-        sigma70=sigma70,
         spread_a=spread_a,
         spread_b=spread_b,
     )
@@ -1391,7 +1018,6 @@ def _simulate_game_with_strategy(
     tempos: dict[str, float],
     strategy: str,
     round_name: str,
-    sigma70: float,
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
@@ -1402,7 +1028,6 @@ def _simulate_game_with_strategy(
         ratings.get(team_b, 0.0),
         tempos.get(team_a, 70.0),
         tempos.get(team_b, 70.0),
-        sigma70=sigma70,
         spread_a=spread_a,
         spread_b=spread_b,
     )
@@ -1427,7 +1052,6 @@ def _run_strategy_once(
     region_games: dict[str, list[tuple[str, str]]],
     ratings: dict[str, float],
     tempos: dict[str, float],
-    sigma70: float,
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
@@ -1440,7 +1064,7 @@ def _run_strategy_once(
         current_teams: list[str] = []
         for game_index, (team_a, team_b) in enumerate(region_games[region], start=1):
             winner, base_p_a, adjusted_p_a = _simulate_game_with_strategy(
-                team_a, team_b, ratings, tempos, strategy, "R64", sigma70, spread_a, spread_b, rng, r64_odds
+                team_a, team_b, ratings, tempos, strategy, "R64", spread_a, spread_b, rng, r64_odds
             )
             rows.append(
                 _pick_row(
@@ -1458,15 +1082,15 @@ def _run_strategy_once(
             current_teams.append(winner)
 
         current_teams, new_rows = _run_round_pairs(
-            strategy, "R32", region, current_teams, ratings, tempos, sigma70, spread_a, spread_b, rng
+            strategy, "R32", region, current_teams, ratings, tempos, spread_a, spread_b, rng
         )
         rows.extend(new_rows)
         current_teams, new_rows = _run_round_pairs(
-            strategy, "S16", region, current_teams, ratings, tempos, sigma70, spread_a, spread_b, rng
+            strategy, "S16", region, current_teams, ratings, tempos, spread_a, spread_b, rng
         )
         rows.extend(new_rows)
         current_teams, new_rows = _run_round_pairs(
-            strategy, "E8", region, current_teams, ratings, tempos, sigma70, spread_a, spread_b, rng
+            strategy, "E8", region, current_teams, ratings, tempos, spread_a, spread_b, rng
         )
         rows.extend(new_rows)
         champs_by_region[region] = current_teams[0]
@@ -1475,11 +1099,11 @@ def _run_strategy_once(
     regional_champs = [champs_by_region[r] for r in f4_region_order if r in champs_by_region]
 
     ff_winners, ff_rows = _run_round_pairs(
-        strategy, "F4", "FinalFour", regional_champs, ratings, tempos, sigma70, spread_a, spread_b, rng
+        strategy, "F4", "FinalFour", regional_champs, ratings, tempos, spread_a, spread_b, rng
     )
     rows.extend(ff_rows)
     title_winner, ncg_rows = _run_round_pairs(
-        strategy, "NCG", "Final", ff_winners, ratings, tempos, sigma70, spread_a, spread_b, rng
+        strategy, "NCG", "Final", ff_winners, ratings, tempos, spread_a, spread_b, rng
     )
     rows.extend(ncg_rows)
 
@@ -1508,7 +1132,6 @@ def _run_round_pairs(
     teams: list[str],
     ratings: dict[str, float],
     tempos: dict[str, float],
-    sigma70: float,
     spread_a: float,
     spread_b: float,
     rng: np.random.Generator,
@@ -1524,7 +1147,6 @@ def _run_round_pairs(
             tempos,
             strategy,
             round_name,
-            sigma70,
             spread_a,
             spread_b,
             rng,
