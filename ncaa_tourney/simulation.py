@@ -39,6 +39,16 @@ ALL_STRATEGIES = list(STRATEGY_RANDOMNESS.keys()) + ["safe_plus"]
 #                game will be picked deterministically or with "safe" randomness
 
 
+# Per-round alpha sharpening for safe_seeded opponent simulation.
+# Values > 1 push probabilities toward the favorite (chalk); < 1 toward 50/50 (upsets).
+# Early rounds (R64-S16): mild chalk boost — pool leans slightly more chalk than the
+# raw power model predicts (~23% vs ~18% observed R64 upset rate).
+# Late rounds (E8-NCG): mild flatten — people differentiate more on late picks,
+# especially the championship (62% observed NCG upset rate vs 43% uncalibrated).
+# Values kept close to 1.0 to preserve log-likelihood fit on individual brackets.
+# Order: R64, R32, S16, E8, F4, NCG
+SAFE_SEEDED_SHARPENING = np.array([1.3, 1.2, 1.2, 0.85, 0.85, 0.55])
+
 DEFAULT_ROUND_POINTS = {
     "R64": 1,
     "R32": 2,
@@ -467,7 +477,8 @@ def optimize_pool_bracket(
             if opponent_power_ratings is None:
                 raise ValueError("safe_seeded opponent strategy requires opponent_power_ratings (--opponent-power-ratings)")
             from ncaa_tourney.power_model import simulate_forward_bracket
-            opp_picks = simulate_forward_bracket(opponent_power_ratings, region_games, rng)
+            opp_picks = simulate_forward_bracket(opponent_power_ratings, region_games, rng,
+                                                 round_sharpening=SAFE_SEEDED_SHARPENING)
         elif opp_strategy == "safe_plus":
             _, opp_picks, _ = _safe_plus_bracket_rows(
                 regions, region_games, opponent_ratings, opponent_tempos, seeds,

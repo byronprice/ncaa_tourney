@@ -488,6 +488,7 @@ def _play_bracket(
     region_games: dict[str, list[tuple[str, str]]],
     rng: np.random.Generator,
     track_adv: dict[str, int] | None = None,
+    round_sharpening: np.ndarray | None = None,
 ) -> list[str]:
     """Inner bracket simulation used by both simulate_forward_bracket and compute_marginals_sim.
 
@@ -518,7 +519,8 @@ def _play_bracket(
                 + (gamma if upset_flags.get(t, False) else 0.0))
 
     def play(a: str, b: str, r: int) -> str:
-        p = 1.0 / (1.0 + math.exp(-alpha[r] * (eff(a) - eff(b))))
+        sharp = float(round_sharpening[r]) if round_sharpening is not None else 1.0
+        p = 1.0 / (1.0 + math.exp(-alpha[r] * sharp * (eff(a) - eff(b))))
         winner, loser = (a, b) if rng.random() < p else (b, a)
         if gamma != 0.0 and eff(winner) < eff(loser):
             upset_flags[winner] = True
@@ -574,6 +576,7 @@ def simulate_forward_bracket(
     params: dict[str, float],
     region_games: dict[str, list[tuple[str, str]]],
     rng: np.random.Generator,
+    round_sharpening: np.ndarray | None = None,
 ) -> list[str]:
     """Forward-simulate a complete bracket using power ratings.
 
@@ -593,7 +596,8 @@ def simulate_forward_bracket(
         _simulate_bracket_rows picks output.
     """
     theta_dict, alpha, gamma, sigma = load_params(params)
-    return _play_bracket(theta_dict, alpha, gamma, sigma, region_games, rng)
+    return _play_bracket(theta_dict, alpha, gamma, sigma, region_games, rng,
+                         round_sharpening=round_sharpening)
 
 
 def compute_marginals_sim(

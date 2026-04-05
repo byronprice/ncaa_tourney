@@ -160,14 +160,21 @@ python -m ncaa_tourney.cli optimize-picks \
   --n-outcomes 2000 \
   --round-points 1,2,4,8,16,32 \
   --candidate-mix 0.34,0.33,0.33 \
-  --opponent-mix 0.35,0.25,0.3,0.1 \
+  --opponent-mix 0.10,0.60,0.10,0.10,0.00,0.10 \
   --opponent-power-ratings output/power_ratings.csv \
   --seed 42 \
   --out output/optimized_picks.csv \
   --out-summary output/optimized_picks_summary.csv
 ```
 
-`--opponent-mix` takes five values: `safe,safe_seeded,balanced,upset_heavy,safe_plus`. The `safe_seeded` slice represents public pickers; when `--opponent-power-ratings` is provided, those opponents are simulated via the fitted power model.
+`--opponent-mix` takes six comma-separated weights (need not sum to 1 — normalized internally):
+
+```
+safe, safe_seeded, balanced, upset_heavy, safe_plus, chalk_plus
+```
+
+See [Opponent strategy profiles](#opponent-strategy-profiles) below for what each means.
+Recommended starting mix based on empirical pool analysis: `0.10,0.60,0.10,0.10,0.00,0.10`.
 
 `--candidate-mix` takes four values: `safe,balanced,upset_heavy,safe_plus`
 
@@ -236,14 +243,41 @@ export KENPOM_COOKIE='your_cookie_header_here'
 - `output/optimized_picks.csv`: a single pool-optimized bracket (max first-place equity vs modeled field)
 - `output/optimized_picks_summary.csv`: top candidate brackets ranked by first-place equity
 
-## Strategy profiles
+## Opponent strategy profiles
 
-- `safe`: uses pure model probabilities (no strategy adjustment)
-- `balanced`: pulls favorites partway toward 50/50 to increase variance
-- `upset_heavy`: pulls favorites more strongly toward 50/50, creating the highest variance
-- `optimize-picks` uses `--opponent-mix safe,safe_seeded,balanced,upset_heavy` (4 values summing to 1) to control the opponent field composition.
-- `safe_seeded` opponents are public pickers — simulated via the fitted power model when `--opponent-power-ratings` is provided (recommended), or via backward-sampling from `--opponent-team-popularity` (legacy fallback).
-- Built-in seed-pair upset priors are applied for `R64`, `R32`, and `S16` in BPI-based opponent strategies.
+These control how simulated opponents in `optimize-picks` generate their brackets.
+Pass weights as `--opponent-mix safe,safe_seeded,balanced,upset_heavy,safe_plus,chalk_plus`.
+
+| Strategy | Description |
+|---|---|
+| `safe` | Picks each game using the BPI/spread win probability directly. Favorites win most of the time but upsets occur proportional to actual model probability (~20% R64 upset rate). No deliberate randomness added. |
+| `safe_seeded` | Uses the fitted power model (σ(α_r · θ_i − θ_j)) with round-specific scaling. Requires `--opponent-power-ratings`. Per-round alpha sharpening (`SAFE_SEEDED_SHARPENING` in `simulation.py`) nudges early rounds slightly toward chalk and late rounds slightly toward upsets to better match observed public pick behavior. **Best model for the majority of public pickers** — fits real bracket pick distributions better by log-likelihood than any other single strategy. |
+| `balanced` | Adds moderate randomness pulling win probabilities toward 50/50 each round (round-specific rates from `STRATEGY_RANDOMNESS`). Produces more upsets than `safe` throughout the bracket. |
+| `upset_heavy` | Applies a larger randomness adjustment than `balanced`, creating the highest-variance brackets. Models pickers who actively seek upsets at every round. |
+| `safe_plus` | Runs a full `safe` simulation, then randomly flips 1–10 R64 outcomes (weighted by game competitiveness). Captures pickers who are mostly chalk but take a few deliberate early-round upsets. |
+| `chalk_plus` | 60% of games are picked deterministically (always the rating favorite); 40% use `safe` probabilities. Produces the lowest upset rates in early rounds (~8% R64). Models the most chalk-heavy pickers in a typical pool. |
+
+### Recommended opponent mix
+
+Based on log-likelihood analysis against a 16-bracket pool sample, the following mix is a good starting point for a typical bracket pool:
+
+```
+--opponent-mix 0.10,0.60,0.10,0.10,0.00,0.10
+               safe  ss   bal  uh   sp   cp
+```
+
+The 60% `safe_seeded` weight reflects that most public pickers reason probabilistically from public ratings/seeds. The 10% `chalk_plus` captures the chalk-heaviest entrants. 
+
+### Candidate strategy profiles
+
+`--candidate-mix` controls how your own candidate brackets are generated (these are the brackets you're optimizing):
+
+| Strategy | Description |
+|---|---|
+| `safe` | Picks by pure model win probability — low variance, high expected accuracy. |
+| `balanced` | Moderate randomness toward 50/50 per round — medium variance. |
+| `upset_heavy` | High randomness toward 50/50 — maximum variance, useful for differentiating from a chalk field. |
+| `safe_plus` | Safe simulation with 1–10 random R64 upsets flipped in — a middle ground between safe and balanced. |
 
 ### ESPN pick popularity file format
 
@@ -293,7 +327,7 @@ conda run -n ncaab python -m ncaa_tourney.cli optimize-picks \
   --n-outcomes 5000 \
   --round-points 1,2,4,8,16,32 \
   --candidate-mix 0.34,0.33,0.33 \
-  --opponent-mix 0.25,0.25,0.35,0.15 \
+  --opponent-mix 0.10,0.60,0.10,0.10,0.00,0.10 \
   --opponent-power-ratings output/power_ratings.csv \
   --seed 42 \
   --spread-a -0.78 \
